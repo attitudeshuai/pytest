@@ -362,6 +362,7 @@ default_plugins = (
     "setuponly",
     "setupplan",
     "stepwise",
+    "knownfailures",
     "unraisableexception",
     "threadexception",
     "warnings",
