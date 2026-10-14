@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Mapping
 from collections.abc import MutableMapping
@@ -12,11 +13,19 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
+from types import TracebackType
 from typing import Any
+from typing import cast
 from typing import final
 from typing import overload
+from typing import TYPE_CHECKING
 from typing import TypeVar
 import warnings
+
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 from _pytest.compat import NOTSET
 from _pytest.compat import NotSetType
@@ -48,6 +57,7 @@ def monkeypatch() -> Generator[MonkeyPatch]:
     * :meth:`monkeypatch.syspath_prepend(path) <pytest.MonkeyPatch.syspath_prepend>`
     * :meth:`monkeypatch.chdir(path) <pytest.MonkeyPatch.chdir>`
     * :meth:`monkeypatch.context() <pytest.MonkeyPatch.context>`
+    * :meth:`monkeypatch.assembly() <pytest.MonkeyPatch.assembly>`
 
     All modifications will be undone after the requesting test function or
     fixture has finished. The ``raising`` parameter determines if a :class:`KeyError`
@@ -143,6 +153,9 @@ class MonkeyPatch:
         self._setitem: list[tuple[Mapping[Any, Any], object, object]] = []
         self._cwd: str | None = None
         self._savesyspath: list[str] | None = None
+        # Serializes journal commits from concurrent transactional
+        # assemblies; the single-point patch/undo paths do not take it.
+        self._assembly_lock = threading.RLock()
 
     @classmethod
     @contextmanager
@@ -170,6 +183,45 @@ class MonkeyPatch:
             yield m
         finally:
             m.undo()
+
+    def assembly(self, name: str | None = None) -> MonkeyPatchAssembly:
+        """Open a transactional assembly unit scoped to this patch object.
+
+        Returns a context manager which offers the same patch methods as
+        :class:`MonkeyPatch` (``setattr``/``delattr``/``setitem``/
+        ``delitem``/``setenv``/``delenv``/``syspath_prepend``/``chdir``).
+
+        Changes inside the ``with`` block take effect immediately, but are
+        journaled locally by the unit instead of on this object:
+
+        * When the block finishes without error, all changes are committed
+          to this patch object, so they are undone together with it (test
+          tear-down, :meth:`undo`, or an enclosing assembly).
+        * When any patch step fails, the changes already applied inside
+          the unit are rolled back in reverse order and a
+          :class:`MonkeyPatchAssemblyError` is raised. The error identifies
+          the failing step (1-based index and a readable operation
+          description) and keeps the original exception as its cause.
+        * If restoring a single change fails, the rollback continues with
+          the remaining changes and reports every restore failure
+          collectively on the raised error instead of aborting halfway.
+        * Units may be nested: a failing inner unit rolls back only its own
+          changes and never pollutes the enclosing journal. Separate
+          units, including units used concurrently from different threads,
+          keep independent journals.
+
+        :param name:
+            Optional label of the unit, included in error reports.
+
+        Example:
+
+        .. code-block:: python
+
+            with monkeypatch.assembly("feature-x environment") as patch:
+                patch.setenv("FEATURE_X", "1")
+                patch.setattr("os.getcwd", lambda: "/tmp")
+        """
+        return MonkeyPatchAssembly(self, name=name)
 
     @overload
     def setattr(
@@ -454,3 +506,309 @@ class MonkeyPatch:
         if self._cwd is not None:
             os.chdir(self._cwd)
             self._cwd = None
+
+
+def _safe_repr(value: object, limit: int = 60) -> str:
+    """Best-effort short repr which never raises on broken ``__repr__``."""
+    try:
+        text = repr(value)
+    except Exception as exc:
+        text = f"<{type(value).__name__} with broken __repr__: {exc}>"
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
+class MonkeyPatchAssemblyError(Exception):
+    """Raised when a transactional :meth:`MonkeyPatch.assembly` unit fails.
+
+    Attributes:
+        name:
+            Optional label passed to :meth:`MonkeyPatch.assembly`.
+        step:
+            1-based index of the patch step that failed, or ``None`` when
+            the ``with`` block raised between patch steps.
+        operation:
+            Readable description of the failing step, e.g.
+            ``"setattr(target=<module 'os'>, name='getcwd')"``.
+        original:
+            The original exception that aborted the unit (also the chained
+            cause).
+        rollback_errors:
+            List of ``(operation, exception)`` pairs collected while
+            restoring already-applied changes. A failing restore does not
+            stop the remaining restores.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str | None,
+        step: int | None,
+        operation: str | None,
+        original: BaseException | None,
+        rollback_errors: list[tuple[str, BaseException]],
+    ) -> None:
+        self.name = name
+        self.step = step
+        self.operation = operation
+        self.original = original
+        self.rollback_errors = rollback_errors
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        unit = f" {self.name!r}" if self.name is not None else ""
+        if self.step is not None:
+            message = f"monkeypatch assembly{unit} failed at step {self.step}"
+            if self.operation is not None:
+                message += f" ({self.operation})"
+            if self.original is not None:
+                message += f": {type(self.original).__name__}: {self.original}"
+        else:
+            message = (
+                f"monkeypatch assembly{unit} encountered restore failure(s) "
+                "while rolling back"
+            )
+            if self.original is not None:
+                message += f" after {type(self.original).__name__}: {self.original}"
+        if self.rollback_errors:
+            message += (
+                f"\nrollback could not fully restore "
+                f"{len(self.rollback_errors)} change(s):"
+            )
+            for operation, error in self.rollback_errors:
+                message += f"\n  {operation} -> {type(error).__name__}: {error}"
+        return message
+
+
+# Internal subclass of the ``@final`` MonkeyPatch: both classes live in this
+# module and the unit must reuse the exact same single-point patch
+# implementation so that behavior inside a unit stays identical.
+class MonkeyPatchAssembly(MonkeyPatch):  # type: ignore[misc]
+    """Transactional assembly unit created by :meth:`MonkeyPatch.assembly`.
+
+    While the ``with`` block runs this behaves exactly like a
+    :class:`MonkeyPatch`, but every change is journaled locally:
+
+    * a clean block exit commits the local journal to the parent patch
+      object (or the enclosing unit);
+    * an exception triggers a reverse-order rollback that keeps going
+      even if an individual restore raises, collecting all restore
+      failures for a single report;
+    * each instance owns its journal, so nested and concurrent units
+      cannot interleave or roll back each other's changes.
+    """
+
+    def __init__(self, parent: MonkeyPatch, name: str | None = None) -> None:
+        super().__init__()
+        self._assembly_parent: MonkeyPatch = parent
+        self._assembly_name = name
+        self._assembly_step_count = 0
+        self._assembly_active_step: tuple[int, str] | None = None
+        self._assembly_in_step = False
+        self._assembly_closed = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        if self._assembly_closed:
+            return None
+        if exc_type is None:
+            self._assembly_commit()
+            self._assembly_closed = True
+            return None
+
+        failed_step = self._assembly_active_step
+        rollback_errors = self._assembly_rollback()
+        self._assembly_closed = True
+        if failed_step is None and not rollback_errors:
+            # The failure happened in user code between patch steps and
+            # every change was restored cleanly: propagate the original
+            # exception untouched.
+            return None
+        raise MonkeyPatchAssemblyError(
+            name=self._assembly_name,
+            step=failed_step[0] if failed_step is not None else None,
+            operation=failed_step[1] if failed_step is not None else None,
+            original=exc,
+            rollback_errors=rollback_errors,
+        ) from exc
+
+    # -- step bookkeeping --------------------------------------------------
+
+    def _assembly_step(self, description: str, action: Callable[[], None]) -> None:
+        __tracebackhide__ = True
+        if self._assembly_in_step:
+            # Internal self-call from another step, e.g. setenv() applying
+            # itself through setitem(): it is part of the outer step and
+            # must not be counted or reported as a separate location.
+            action()
+            return
+        self._assembly_step_count += 1
+        self._assembly_active_step = (
+            self._assembly_step_count,
+            description,
+        )
+        self._assembly_in_step = True
+        try:
+            action()
+        except BaseException:
+            # Leave _assembly_active_step set so __exit__ can report this
+            # step; _assembly_in_step resets on the way out of the block.
+            self._assembly_in_step = False
+            raise
+        else:
+            self._assembly_active_step = None
+            self._assembly_in_step = False
+
+    @staticmethod
+    def _describe_target(target: object, operation: str, name: object) -> str:
+        if isinstance(target, str):
+            return f"{operation}(target={_safe_repr(target)})"
+        if isinstance(name, str):
+            return f"{operation}(target={_safe_repr(target)}, name={name!r})"
+        return f"{operation}(target={_safe_repr(target)})"
+
+    # -- patch operations (identical signatures and behavior as the parent)
+
+    def setattr(
+        self,
+        target: str | object,
+        name: object | str,
+        value: object = NOTSET,
+        raising: bool = True,
+    ) -> None:
+        __tracebackhide__ = True
+        description = self._describe_target(target, "setattr", name)
+        # The parent exposes overloaded setattr() signatures which a single
+        # delegating signature cannot match; call the implementation directly.
+        apply = cast(Callable[..., None], super().setattr)
+        self._assembly_step(description, lambda: apply(target, name, value, raising))
+
+    def delattr(
+        self,
+        target: object | str,
+        name: str | NotSetType = NOTSET,
+        raising: bool = True,
+    ) -> None:
+        __tracebackhide__ = True
+        description = self._describe_target(target, "delattr", name)
+        apply = super().delattr
+        self._assembly_step(description, lambda: apply(target, name, raising=raising))
+
+    def setitem(self, dic: Mapping[K, V], name: K, value: V) -> None:
+        description = f"setitem(mapping={_safe_repr(dic)}, key={_safe_repr(name)})"
+        apply = super().setitem
+        self._assembly_step(description, lambda: apply(dic, name, value))
+
+    def delitem(self, dic: Mapping[K, V], name: K, raising: bool = True) -> None:
+        description = f"delitem(mapping={_safe_repr(dic)}, key={_safe_repr(name)})"
+        apply = super().delitem
+        self._assembly_step(description, lambda: apply(dic, name, raising=raising))
+
+    def setenv(self, name: str, value: str, prepend: str | None = None) -> None:
+        apply = super().setenv
+        self._assembly_step(
+            f"setenv(name={name!r})",
+            lambda: apply(name, value, prepend),
+        )
+
+    def delenv(self, name: str, raising: bool = True) -> None:
+        apply = super().delenv
+        self._assembly_step(
+            f"delenv(name={name!r})",
+            lambda: apply(name, raising=raising),
+        )
+
+    def syspath_prepend(self, path: object) -> None:
+        apply = super().syspath_prepend
+        self._assembly_step(
+            f"syspath_prepend(path={_safe_repr(str(path))})",
+            lambda: apply(path),
+        )
+
+    def chdir(self, path: str | os.PathLike[str]) -> None:
+        apply = super().chdir
+        self._assembly_step(
+            f"chdir(path={_safe_repr(os.fspath(path))})",
+            lambda: apply(path),
+        )
+
+    # -- commit / rollback -------------------------------------------------
+
+    def _assembly_commit(self) -> None:
+        """Merge the local journal into the parent, keeping parent state."""
+        parent = self._assembly_parent
+        with parent._assembly_lock:
+            parent._setattr.extend(self._setattr)
+            parent._setitem.extend(self._setitem)
+            # The parent keeps its own earlier snapshots: restoring to the
+            # state captured before the parent's first change also undoes
+            # everything committed by this unit.
+            if self._savesyspath is not None and parent._savesyspath is None:
+                parent._savesyspath = self._savesyspath
+            if self._cwd is not None and parent._cwd is None:
+                parent._cwd = self._cwd
+        self._setattr[:] = []
+        self._setitem[:] = []
+        self._savesyspath = None
+        self._cwd = None
+
+    def _assembly_rollback(self) -> list[tuple[str, BaseException]]:
+        """Restore local changes in reverse order, never aborting early.
+
+        Every restore failure is captured and returned; remaining changes
+        are still restored, mirroring the deletion policy of
+        :meth:`MonkeyPatch.undo` for already-removed entries.
+        """
+        errors: list[tuple[str, BaseException]] = []
+        for obj, attr, old_value in reversed(self._setattr):
+            action = "delattr" if old_value is NOTSET else "setattr"
+            operation = f"restore {action} {_safe_repr(obj)}.{attr!r}"
+            try:
+                if old_value is not NOTSET:
+                    setattr(obj, attr, old_value)
+                else:
+                    delattr(obj, attr)
+            except Exception as exc:
+                errors.append((operation, exc))
+        self._setattr[:] = []
+        for dictionary, key, old_value in reversed(self._setitem):
+            action = "delitem" if old_value is NOTSET else "setitem"
+            operation = (
+                f"restore {action} key={_safe_repr(key)} on {_safe_repr(dictionary)}"
+            )
+            try:
+                if old_value is NOTSET:
+                    try:
+                        # Not all Mapping types support indexing, but
+                        # MutableMapping doesn't support TypedDict
+                        del dictionary[key]
+                    except KeyError:
+                        # Was already deleted, so we have the desired state.
+                        pass
+                else:
+                    # Not all Mapping types support indexing, but MutableMapping doesn't support TypedDict
+                    dictionary[key] = old_value
+            except Exception as exc:
+                errors.append((operation, exc))
+        self._setitem[:] = []
+        if self._savesyspath is not None:
+            try:
+                sys.path[:] = self._savesyspath
+            except Exception as exc:
+                errors.append(("restore sys.path", exc))
+            self._savesyspath = None
+        if self._cwd is not None:
+            try:
+                os.chdir(self._cwd)
+            except Exception as exc:
+                errors.append((f"restore chdir to {self._cwd!r}", exc))
+            self._cwd = None
+        return errors

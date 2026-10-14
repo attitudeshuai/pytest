@@ -43,6 +43,7 @@ from _pytest.mark import MarkDecorator
 from _pytest.mark import MarkGenerator
 from _pytest.mark import param
 from _pytest.monkeypatch import MonkeyPatch
+from _pytest.monkeypatch import MonkeyPatchAssemblyError
 from _pytest.nodes import Collector
 from _pytest.nodes import Directory
 from _pytest.nodes import File
@@ -128,6 +129,7 @@ __all__ = [
     "Metafunc",
     "Module",
     "MonkeyPatch",
+    "MonkeyPatchAssemblyError",
     "OptionGroup",
     "Package",
     "Parser",

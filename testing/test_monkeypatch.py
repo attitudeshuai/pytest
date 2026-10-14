@@ -7,10 +7,12 @@ from pathlib import Path
 import re
 import sys
 import textwrap
+import threading
 from types import MappingProxyType
 import warnings
 
 from _pytest.monkeypatch import MonkeyPatch
+from _pytest.monkeypatch import MonkeyPatchAssemblyError
 from _pytest.pytester import Pytester
 import pytest
 
@@ -688,3 +690,346 @@ def test_syspath_prepend_with_namespace_packages(
 
     modules_tmpdir.joinpath("main_app.py").write_text("app = True", encoding="utf-8")
     from main_app import app  # noqa: F401
+
+
+class TestMonkeyPatchAssembly:
+    def test_commit_then_parent_undo(self, mp: MonkeyPatch) -> None:
+        class C:
+            a = 1
+
+        data = {"x": 1}
+        try:
+            with mp.assembly() as unit:
+                unit.setattr(C, "a", 2)
+                unit.setitem(data, "y", 2)
+                unit.setenv("PYTEST_ASSEMBLY_TEST_VAR", "hello")
+            # Changes stay in effect after the block: committed to parent.
+            assert C.a == 2
+            assert data == {"x": 1, "y": 2}
+            assert os.environ["PYTEST_ASSEMBLY_TEST_VAR"] == "hello"
+
+            mp.undo()
+            assert C.a == 1
+            assert data == {"x": 1}
+            assert "PYTEST_ASSEMBLY_TEST_VAR" not in os.environ
+        finally:
+            os.environ.pop("PYTEST_ASSEMBLY_TEST_VAR", None)
+
+    def test_failure_rolls_back_prior_steps(self, mp: MonkeyPatch) -> None:
+        class C:
+            a = 1
+            b = 2
+
+        data = {"x": 1}
+        with pytest.raises(MonkeyPatchAssemblyError) as excinfo:
+            with mp.assembly() as unit:
+                unit.setattr(C, "a", 10)
+                unit.setitem(data, "y", 20)
+                unit.setattr(C, "no_such_attr", 30)
+
+        error = excinfo.value
+        assert error.step == 3
+        assert error.operation is not None
+        assert "setattr" in error.operation
+        assert "no_such_attr" in error.operation
+        assert isinstance(error.original, AttributeError)
+        assert error.__cause__ is error.original
+        assert error.rollback_errors == []
+        # Already-applied steps were rolled back.
+        assert C.a == 1
+        assert data == {"x": 1}
+        # Parent journal is not polluted: undo is a no-op and safe.
+        mp.undo()
+        assert C.a == 1
+        assert data == {"x": 1}
+
+    def test_failure_location_for_dotted_target(self, mp: MonkeyPatch) -> None:
+        with pytest.raises(MonkeyPatchAssemblyError) as excinfo:
+            with mp.assembly() as unit:
+                unit.setattr("os.path.definitely_not_here", 1)
+        error = excinfo.value
+        assert error.step == 1
+        assert error.operation is not None
+        assert "os.path.definitely_not_here" in error.operation
+        assert "step 1" in str(error)
+
+    def test_named_unit_appears_in_error(self, mp: MonkeyPatch) -> None:
+        class C:
+            pass
+
+        with pytest.raises(MonkeyPatchAssemblyError, match="env-setup") as excinfo:
+            with mp.assembly(name="env-setup") as unit:
+                unit.setattr(C, "a", 1, raising=False)
+                unit.setattr(C, "missing", 2)
+        assert excinfo.value.name == "env-setup"
+
+    def test_env_helpers_count_as_a_single_step(self, mp: MonkeyPatch) -> None:
+        # setenv()/delenv() apply themselves through setitem()/delitem();
+        # that internal self-call must not be counted as another step.
+        try:
+            with mp.assembly() as unit:
+                unit.setenv("PYTEST_ASSEMBLY_STEP_VAR", "1")
+                unit.delenv("PYTEST_ASSEMBLY_STEP_VAR_MISSING", raising=False)
+                unit.setattr("os.path.no_such_attr_xyz", 1)
+        except MonkeyPatchAssemblyError as error:
+            assert error.step == 3
+            assert error.operation is not None
+            assert error.operation.startswith("setattr")
+        else:  # pragma: no cover
+            pytest.fail("assembly did not fail")
+        finally:
+            os.environ.pop("PYTEST_ASSEMBLY_STEP_VAR", None)
+
+    def test_rollback_is_reverse_order(self, mp: MonkeyPatch) -> None:
+        order: list[tuple[str, object]] = []
+
+        class Logger:
+            a: int
+            b: int
+
+            def __setattr__(self, key: str, value: object) -> None:
+                order.append((key, value))
+                object.__setattr__(self, key, value)
+
+        obj = Logger()
+        object.__setattr__(obj, "a", 1)
+        object.__setattr__(obj, "b", 2)
+
+        with pytest.raises(MonkeyPatchAssemblyError):
+            with mp.assembly() as unit:
+                unit.setattr(obj, "a", 10)
+                unit.setattr(obj, "b", 20)
+                unit.setattr("os.path.no_such_attr_xyz", 1)
+
+        # Apply order a, b; reverse-order restore b, a.
+        assert order == [("a", 10), ("b", 20), ("b", 2), ("a", 1)]
+        assert obj.a == 1
+        assert obj.b == 2
+
+    def test_rollback_continues_after_restore_failure(self, mp: MonkeyPatch) -> None:
+        class FlakyObject:
+            boom: str
+            ok: str
+
+            def __setattr__(self, key: str, value: object) -> None:
+                if key == "boom" and value == "orig":
+                    raise RuntimeError("cannot restore attribute")
+                object.__setattr__(self, key, value)
+
+        class FlakyDict(dict):  # type: ignore[type-arg]
+            def __setitem__(self, key: object, value: object) -> None:
+                if key == "boom" and value == "orig":
+                    raise RuntimeError("cannot restore item")
+                super().__setitem__(key, value)
+
+        class Plain:
+            p = "orig"
+
+        flaky_obj = FlakyObject()
+        object.__setattr__(flaky_obj, "boom", "orig")
+        flaky_obj.ok = "orig_ok"
+        flaky_dict: FlakyDict = FlakyDict()
+        dict.update(flaky_dict, {"boom": "orig", "ok": "orig_ok"})
+        plain_dict: dict[str, int] = {}
+
+        with pytest.raises(MonkeyPatchAssemblyError) as excinfo:
+            with mp.assembly() as unit:
+                unit.setattr(flaky_obj, "boom", "new")
+                unit.setattr(flaky_obj, "ok", "new_ok")
+                unit.setattr(Plain, "p", "new")
+                unit.setitem(flaky_dict, "boom", "new")
+                unit.setitem(flaky_dict, "ok", "new_ok")
+                unit.setitem(plain_dict, "x", 1)
+                unit.setattr(Plain, "missing_attr", 1)
+
+        error = excinfo.value
+        # The single failing restore did not abort the remaining restores.
+        assert Plain.p == "orig"
+        assert flaky_obj.ok == "orig_ok"
+        assert flaky_dict["ok"] == "orig_ok"
+        assert "x" not in plain_dict
+        # Unrestorable changes keep their patched values.
+        assert flaky_obj.boom == "new"
+        assert flaky_dict["boom"] == "new"
+        # Restore failures are reported collectively.
+        assert len(error.rollback_errors) == 2
+        descriptions = [desc for desc, _ in error.rollback_errors]
+        assert any("boom" in desc for desc in descriptions)
+        assert all(isinstance(exc, RuntimeError) for _, exc in error.rollback_errors)
+        assert "RuntimeError" in str(error)
+
+    def test_delattr_and_delitem_rolled_back(self, mp: MonkeyPatch) -> None:
+        class C:
+            a = 1
+
+        data = {"x": 1}
+        with pytest.raises(MonkeyPatchAssemblyError):
+            with mp.assembly() as unit:
+                unit.delattr(C, "a")
+                unit.delitem(data, "x")
+                unit.setattr(C, "missing_attr", 2)
+        assert C.a == 1
+        assert data["x"] == 1
+
+    def test_user_error_between_steps_propagates_unchanged(
+        self, mp: MonkeyPatch
+    ) -> None:
+        class C:
+            a = 1
+
+        class MidError(Exception):
+            pass
+
+        with pytest.raises(MidError) as excinfo:
+            with mp.assembly() as unit:
+                unit.setattr(C, "a", 2)
+                raise MidError("boom")
+        assert type(excinfo.value) is MidError
+        assert C.a == 1
+
+    def test_user_error_plus_restore_failure_reports_both(
+        self, mp: MonkeyPatch
+    ) -> None:
+        class FlakyObject:
+            boom: str
+
+            def __setattr__(self, key: str, value: object) -> None:
+                if key == "boom" and value == "orig":
+                    raise RuntimeError("cannot restore")
+                object.__setattr__(self, key, value)
+
+        class MidError(Exception):
+            pass
+
+        flaky_obj = FlakyObject()
+        object.__setattr__(flaky_obj, "boom", "orig")
+
+        with pytest.raises(MonkeyPatchAssemblyError) as excinfo:
+            with mp.assembly(name="flaky-unit") as unit:
+                unit.setattr(flaky_obj, "boom", "new")
+                raise MidError("mid")
+        error = excinfo.value
+        assert error.step is None
+        assert isinstance(error.original, MidError)
+        assert isinstance(error.__cause__, MidError)
+        assert len(error.rollback_errors) == 1
+        assert "boom" in error.rollback_errors[0][0]
+
+    def test_nested_inner_failure_isolated(self, mp: MonkeyPatch) -> None:
+        class C:
+            a = 1
+
+        with mp.assembly() as outer:
+            outer.setattr(C, "a", 2)
+            with pytest.raises(MonkeyPatchAssemblyError):
+                with outer.assembly(name="inner") as inner:
+                    inner.setattr(C, "b", 3, raising=False)
+                    inner.setattr(C, "missing_attr", 4)
+            # Inner rollback does not touch outer changes.
+            assert C.a == 2
+            assert not hasattr(C, "b")
+            outer.setattr(C, "c", 4, raising=False)
+
+        assert C.a == 2
+        assert C.c == 4  # type: ignore[attr-defined]
+        assert not hasattr(C, "b")
+        mp.undo()
+        assert C.a == 1
+        assert not hasattr(C, "b")
+        assert not hasattr(C, "c")
+
+    def test_nested_inner_success_outer_failure_rolls_back_all(
+        self, mp: MonkeyPatch
+    ) -> None:
+        class C:
+            a = 1
+
+        with pytest.raises(MonkeyPatchAssemblyError):
+            with mp.assembly() as outer:
+                outer.setattr(C, "a", 2)
+                with outer.assembly() as inner:
+                    inner.setattr(C, "b", 3, raising=False)
+                assert C.b == 3  # type: ignore[attr-defined]
+                outer.setattr(C, "missing_attr", 4)
+        assert C.a == 1
+        assert not hasattr(C, "b")
+
+    def test_failed_assembly_keeps_parent_patches(self, mp: MonkeyPatch) -> None:
+        class C:
+            pre = 0
+
+        mp.setattr(C, "pre", 1, raising=False)
+        with pytest.raises(MonkeyPatchAssemblyError):
+            with mp.assembly() as unit:
+                unit.setattr(C, "inside", 2, raising=False)
+                unit.setattr(C, "missing_attr", 3)
+        assert C.pre == 1
+        assert not hasattr(C, "inside")
+        mp.undo()
+        assert C.pre == 0
+
+    def test_syspath_prepend_and_chdir_committed(
+        self, mp: MonkeyPatch, tmp_path: Path
+    ) -> None:
+        old_path = sys.path[:]
+        old_cwd = os.getcwd()
+        try:
+            with mp.assembly() as unit:
+                unit.chdir(tmp_path)
+                unit.syspath_prepend(str(tmp_path))
+            assert os.getcwd() == str(tmp_path)
+            assert sys.path[0] == str(tmp_path)
+
+            mp.undo()
+            assert os.getcwd() == old_cwd
+            assert sys.path == old_path
+        finally:
+            os.chdir(old_cwd)
+            sys.path[:] = old_path
+
+    def test_concurrent_assemblies_are_isolated(self, mp: MonkeyPatch) -> None:
+        class C:
+            pass
+
+        data: dict[str, int] = {}
+        errors: list[BaseException] = []
+        failed: list[int] = []
+        worker_count = 12
+        barrier = threading.Barrier(worker_count)
+
+        def worker(i: int) -> None:
+            barrier.wait()
+            try:
+                with mp.assembly(name=f"unit-{i}") as unit:
+                    unit.setattr(C, f"attr_{i}", i, raising=False)
+                    unit.setitem(data, f"key_{i}", i)
+                    if i == 3:
+                        unit.setattr(C, "totally_missing_attr", 99)
+            except MonkeyPatchAssemblyError as exc:
+                failed.append(i)
+                errors.append(exc)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,)) for i in range(worker_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert failed == [3]
+        assert len(errors) == 1
+        for i in range(worker_count):
+            if i == 3:
+                assert not hasattr(C, "attr_3")
+                assert "key_3" not in data
+            else:
+                assert getattr(C, f"attr_{i}") == i
+                assert data[f"key_{i}"] == i
+
+        mp.undo()
+        for i in range(worker_count):
+            assert not hasattr(C, f"attr_{i}")
+            assert f"key_{i}" not in data
