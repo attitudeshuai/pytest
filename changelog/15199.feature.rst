@@ -1,0 +1,12 @@
+Added ``--capture-to-disk`` (and the ``capture_to_disk`` ini option) to
+persist each test item's captured output to independent files under a
+directory tree that mirrors the test node id. The standard output,
+standard error and raw file-descriptor-level output (including writes by
+subprocesses) are written to separate files per phase
+(``setup``/``call``/``teardown``). By default only the output of failed
+items is kept; ``--capture-to-disk-retain=all`` keeps everything and
+``--capture-to-disk-max-size`` bounds the total retained size. Reports
+gain ``captured_output_files``/``captured_output_dir`` attributes and a
+"Captured output files" section pointing at the files; errors while
+writing never change test outcomes, and concurrent processes (e.g. xdist
+workers) write into separate sub-directories.

@@ -1770,3 +1770,414 @@ def test_libedit_workaround(pytester: Pytester) -> None:
     match = re.search(r"^value: '(.*)'\r?$", rest, re.MULTILINE)
     assert match is not None
     assert match.group(1) == "hi"
+
+
+#
+# Tests for the opt-in per-item on-disk capture (--capture-to-disk).
+#
+
+
+def test_parse_disk_size() -> None:
+    assert capture._parse_disk_size("0") == 0
+    assert capture._parse_disk_size("1024") == 1024
+    assert capture._parse_disk_size("2K") == 2048
+    assert capture._parse_disk_size("3MB") == 3 * 1024**2
+    assert capture._parse_disk_size("1.5g") == int(1.5 * 1024**3)
+    assert capture._parse_disk_size("  100 B ") == 100
+    with pytest.raises(ValueError):
+        capture._parse_disk_size("abc")
+    with pytest.raises(ValueError):
+        capture._parse_disk_size("-1")
+
+
+def test_sanitize_disk_component_is_injective() -> None:
+    sanitize = capture._sanitize_disk_component
+    # Percent-encoding keeps distinguishable names apart.
+    assert sanitize("a/b") == "a%2Fb"
+    assert sanitize("a%2Fb") == "a%252Fb"
+    assert sanitize("a/b") != sanitize("a%2Fb")
+    # All characters illegal on Windows are encoded.
+    for char in '<>:"/\\|?*%':
+        assert sanitize(char) == f"%{ord(char):02X}"
+    # Trailing dot/space and reserved names get neutralised.
+    assert sanitize("name.").endswith("%2E")
+    assert sanitize("con").endswith("_")
+    assert sanitize("CON.py").endswith("_")
+    # Long components still map to distinct, length-bounded names.
+    long_a = "a" * 300
+    long_b = "b" * 300
+    encoded_a = sanitize(long_a)
+    encoded_b = sanitize(long_b)
+    assert len(encoded_a) <= capture._DISK_MAX_COMPONENT_LEN
+    assert encoded_a != encoded_b
+    assert encoded_a.startswith("a")
+
+
+class TestCaptureToDisk:
+    def _records(self, pytester: Pytester):
+        import ast
+
+        lines = (pytester.path / "reports.txt").read_text().splitlines()
+        return [ast.literal_eval(line) for line in lines if line]
+
+    def _record_conftest(self, pytester: Pytester) -> None:
+        pytester.makeconftest(
+            """
+            def pytest_runtest_logreport(report):
+                with open("reports.txt", "a", encoding="utf-8") as f:
+                    f.write(repr((
+                        report.nodeid,
+                        report.when,
+                        report.outcome,
+                        getattr(report, "captured_output_files", -1),
+                        getattr(report, "captured_output_dir", -1),
+                    )) + "\\n")
+            """
+        )
+
+    def test_disabled_by_default(self, pytester: Pytester) -> None:
+        self._record_conftest(pytester)
+        pytester.makepyfile(test_mod="def test_it():\n    print('hello')\n")
+        result = pytester.runpytest()
+        result.assert_outcomes(passed=1)
+        # No new attributes and no on-disk traces when not opted in.
+        records = self._records(pytester)
+        assert records
+        assert all(files == -1 and directory == -1 for *_, files, directory in records)
+        result.stdout.no_fnmatch_line("*Captured output files*")
+        result.stdout.no_fnmatch_line("*captured output files*")
+
+    def test_failed_kept_passed_removed(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            def test_pass():
+                print('pass out')
+
+            def test_fail():
+                import sys
+                print('fail out')
+                sys.stderr.write('fail err\\n')
+                assert False
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(passed=1, failed=1)
+
+        # The passing item's directory is gone (default 'failed' policy) ...
+        assert not (root / "test_mod.py" / "test_pass").exists()
+        # ... while the failing item's files remain.
+        fail_dir = root / "test_mod.py" / "test_fail"
+        assert (fail_dir / "call.stdout").read_text(encoding="utf-8") == "fail out\n"
+        assert (fail_dir / "call.stderr").read_text(encoding="utf-8") == "fail err\n"
+        assert (fail_dir / "call.stdout.bin").read_bytes() == b"fail out\n"
+        assert (fail_dir / "call.stderr.bin").read_bytes() == b"fail err\n"
+        # Empty streams do not create files; setup/teardown produced nothing.
+        assert set(p.name for p in fail_dir.iterdir()) == {
+            "call.stdout",
+            "call.stderr",
+            "call.stdout.bin",
+            "call.stderr.bin",
+        }
+        result.stdout.fnmatch_lines(
+            [
+                "*1 test item(s) with captured output kept in*",
+            ]
+        )
+
+    def test_directory_mirrors_nodeid(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            class TestClass:
+                def test_method(self):
+                    print('x')
+                    assert False
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(failed=1)
+        expected = root / "test_mod.py" / "TestClass" / "test_method" / "call.stdout"
+        assert expected.read_text(encoding="utf-8") == "x\n"
+
+    def test_raw_fd_bytes_and_subprocess_output(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            import os
+            import subprocess
+            import sys
+
+            def test_it():
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os; os.write(1, b'sub-out' + bytes([10]))",
+                    ],
+                    check=True,
+                )
+                os.write(2, b"\\xff\\xfe raw err\\n")
+                print("text out")
+                assert False
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(failed=1)
+        item_dir = root / "test_mod.py" / "test_it"
+        # Text files keep the report-exact (lossy) decoding ...
+        assert "text out\n" in (item_dir / "call.stdout").read_text("utf-8")
+        assert "sub-out\n" in (item_dir / "call.stdout").read_text("utf-8")
+        # ... while the .bin files preserve undecoded fd-level bytes.
+        assert b"sub-out\n" in (item_dir / "call.stdout.bin").read_bytes()
+        assert (item_dir / "call.stderr.bin").read_bytes().startswith(b"\xff\xfe")
+
+    def test_retain_all_keeps_passing(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            def test_pass():
+                print('pass out')
+            """
+        )
+        result = pytester.runpytest(
+            f"--capture-to-disk={root}", "--capture-to-disk-retain=all"
+        )
+        result.assert_outcomes(passed=1)
+        assert (root / "test_mod.py" / "test_pass" / "call.stdout").read_text(
+            "utf-8"
+        ) == "pass out\n"
+
+    def test_ini_enables(self, pytester: Pytester) -> None:
+        pytester.makeini(
+            """
+            [pytest]
+            capture_to_disk = cap
+            capture_to_disk_retain = all
+            """
+        )
+        pytester.makepyfile(test_mod="def test_it():\n    print('ini out')\n")
+        result = pytester.runpytest()
+        result.assert_outcomes(passed=1)
+        assert (
+            pytester.path / "cap" / "test_mod.py" / "test_it" / "call.stdout"
+        ).read_text("utf-8") == "ini out\n"
+
+    def test_cli_overrides_ini(self, pytester: Pytester) -> None:
+        pytester.makeini(
+            """
+            [pytest]
+            capture_to_disk = from_ini
+            capture_to_disk_retain = all
+            """
+        )
+        pytester.makepyfile(test_mod="def test_it():\n    print('x')\n")
+        cli_root = pytester.path / "from_cli"
+        result = pytester.runpytest(f"--capture-to-disk={cli_root}")
+        result.assert_outcomes(passed=1)
+        assert (cli_root / "test_mod.py" / "test_it" / "call.stdout").exists()
+        assert not (pytester.path / "from_ini").exists()
+
+    def test_relative_path_under_rootdir(self, pytester: Pytester) -> None:
+        pytester.makepyfile(test_mod="def test_it():\n    print('x')\n")
+        result = pytester.runpytest("--capture-to-disk=relcap", "--capture-to-disk-retain=all")
+        result.assert_outcomes(passed=1)
+        assert (
+            pytester.path / "relcap" / "test_mod.py" / "test_it" / "call.stdout"
+        ).exists()
+
+    def test_max_size_evicts_oldest(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            import pytest
+
+            @pytest.mark.parametrize("i", range(3))
+            def test_it(i):
+                print("x" * 20)
+            """
+        )
+        # Each item keeps 21 bytes text + 21 raw bytes = 42 bytes.
+        result = pytester.runpytest(
+            f"--capture-to-disk={root}",
+            "--capture-to-disk-retain=all",
+            "--capture-to-disk-max-size=45",
+        )
+        result.assert_outcomes(passed=3)
+        mod_dir = root / "test_mod.py"
+        remaining = sorted(p.name for p in mod_dir.iterdir())
+        # The two oldest are evicted; the just-finished item is kept.
+        assert remaining == ["test_it[2]"]
+        result.stdout.fnmatch_lines(["*2 item(s) evicted*"])
+
+    def test_write_error_never_fails_the_test(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        root.mkdir()
+        # A regular FILE where the feature needs a directory makes every
+        # per-item write fail.
+        (root / "test_mod.py").write_text("", encoding="utf-8")
+        p = pytester.makepyfile(
+            test_mod="""
+            def test_fail():
+                print('still captured normally')
+                assert False
+            """
+        )
+        # Collect only the real test file, not the blocking file under cap/.
+        result = pytester.runpytest(str(p), f"--capture-to-disk={root}")
+        # The disk failure does not change the outcome: one test failure.
+        result.assert_outcomes(failed=1)
+        # In-memory capture and report sections are untouched.
+        result.stdout.fnmatch_lines(
+            [
+                "*Captured stdout call*",
+                "still captured normally",
+                "*error(s) while writing captured output to disk were ignored*",
+            ]
+        )
+
+    def test_sanitized_param_dirs_stay_distinct(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            import pytest
+
+            @pytest.mark.parametrize("x", ["a/b", "a%2Fb", "q" * 200])
+            def test_it(x):
+                print(x)
+            """
+        )
+        result = pytester.runpytest(
+            f"--capture-to-disk={root}", "--capture-to-disk-retain=all"
+        )
+        result.assert_outcomes(passed=3)
+        item_dirs = [p for p in (root / "test_mod.py").iterdir() if p.is_dir()]
+        assert len(item_dirs) == 3
+        for item_dir in item_dirs:
+            assert (item_dir / "call.stdout").exists()
+
+    def test_report_attributes(self, pytester: Pytester) -> None:
+        self._record_conftest(pytester)
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            def test_pass():
+                print('p')
+
+            def test_fail():
+                print('f')
+                assert False
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(passed=1, failed=1)
+        records = self._records(pytester)
+
+        fail_call = next(
+            r
+            for r in records
+            if r[0].endswith("test_fail") and r[1] == "call"
+        )
+        files = fail_call[3]
+        assert set(files) == {"stdout", "stdout_fd"}
+        assert files["stdout"].endswith("call.stdout")
+        assert files["stdout_fd"].endswith("call.stdout.bin")
+
+        fail_teardown = next(
+            r
+            for r in records
+            if r[0].endswith("test_fail") and r[1] == "teardown"
+        )
+        assert fail_teardown[4] is not None
+        assert fail_teardown[4].endswith(str(root / "test_mod.py" / "test_fail"))
+
+        pass_teardown = next(
+            r
+            for r in records
+            if r[0].endswith("test_pass") and r[1] == "teardown"
+        )
+        # Passing items are pruned: no retained directory is reported.
+        assert pass_teardown[4] is None
+
+    def test_setup_failure_is_kept(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            import pytest
+
+            @pytest.fixture
+            def broken():
+                print('setup output')
+                raise RuntimeError('boom')
+
+            def test_it(broken):
+                pass
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(errors=1)
+        assert (root / "test_mod.py" / "test_it" / "setup.stdout").read_text(
+            "utf-8"
+        ) == "setup output\n"
+
+    def test_capture_no_writes_nothing(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(test_mod="def test_it():\n    print('x')\n")
+        result = pytester.runpytest("--capture=no", f"--capture-to-disk={root}")
+        result.assert_outcomes(passed=1)
+        # Nothing is captured at all, so nothing is archived either.
+        assert not any(root.rglob("call.*"))
+
+    def test_worker_token_avoids_clashes(
+        self, pytester: Pytester, monkeypatch: MonkeyPatch
+    ) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(test_mod="def test_it():\n    print('x')\n")
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw7")
+        result = pytester.runpytest(
+            f"--capture-to-disk={root}", "--capture-to-disk-retain=all"
+        )
+        result.assert_outcomes(passed=1)
+        token_dir = root / "test_mod.py" / "test_it" / "gw7"
+        assert (token_dir / "call.stdout").exists()
+        assert (token_dir / "call.stdout.bin").exists()
+
+        # Another worker gets its own sub-directory.
+        monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw8")
+        result = pytester.runpytest(
+            f"--capture-to-disk={root}", "--capture-to-disk-retain=all"
+        )
+        result.assert_outcomes(passed=1)
+        assert (root / "test_mod.py" / "test_it" / "gw8" / "call.stdout").exists()
+        assert (root / "test_mod.py" / "test_it" / "gw7" / "call.stdout").exists()
+
+    def test_failure_report_sections_unchanged(self, pytester: Pytester) -> None:
+        root = pytester.path / "cap"
+        pytester.makepyfile(
+            test_mod="""
+            def test_fail():
+                print('section content')
+                assert False
+            """
+        )
+        result = pytester.runpytest(f"--capture-to-disk={root}")
+        result.assert_outcomes(failed=1)
+        # Original captured sections come first, verbatim, followed by the
+        # pointer to the on-disk files.
+        result.stdout.fnmatch_lines(
+            [
+                "*- Captured stdout call*",
+                "section content",
+                "*- Captured output files call*",
+                "*standard output:*call.stdout",
+                "*file-descriptor-level*raw bytes*call.stdout.bin",
+            ]
+        )
+
+    def test_invalid_options(self, pytester: Pytester) -> None:
+        pytester.makepyfile(test_mod="def test_it():\n    pass\n")
+        result = pytester.runpytest("--capture-to-disk=cap", "--capture-to-disk-retain=nope")
+        assert result.ret == ExitCode.USAGE_ERROR
+        result = pytester.runpytest("--capture-to-disk=cap", "--capture-to-disk-max-size=big")
+        assert result.ret == ExitCode.USAGE_ERROR
+

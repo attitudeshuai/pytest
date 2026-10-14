@@ -334,6 +334,16 @@ class TestReport(BaseReport):
     # xfail reason if xfailed, otherwise not defined. Use hasattr to distinguish.
     wasxfail: str
 
+    # Defined by the capture-to-disk feature (--capture-to-disk) only.
+    # Per-phase mapping of logical stream name ("stdout", "stderr",
+    # "stdout_fd", "stderr_fd") to the absolute path of the file the
+    # captured output was written to; use hasattr to distinguish.
+    captured_output_files: dict[str, str]
+    # Directory holding the item's retained capture files, set on the
+    # teardown report (``None`` when the item's output was not retained);
+    # use hasattr to distinguish.
+    captured_output_dir: str | None
+
     _id: NodeId
 
     @property

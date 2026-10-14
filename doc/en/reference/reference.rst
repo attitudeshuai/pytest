@@ -1815,6 +1815,40 @@ passed multiple times. The expected format is ``name=value``. For example::
             junit_log_passing_tests = False
 
 
+.. confval:: capture_to_disk
+    :type: ``str``
+    :default: ``""``
+
+    .. versionadded:: 9.2
+
+    Directory in which each test item's captured output is persisted to
+    separate files, equivalent to :option:`--capture-to-disk` (the
+    command-line option takes precedence). Relative paths are resolved
+    against :ref:`rootdir <rootdir>`. Empty (the default) disables the
+    feature.
+
+.. confval:: capture_to_disk_retain
+    :type: ``"failed" | "all"``
+    :default: ``"failed"``
+
+    .. versionadded:: 9.2
+
+    Which items keep their on-disk captured output: ``failed`` keeps only
+    failed items (including setup/teardown errors), ``all`` keeps every
+    item. Can be overridden with :option:`--capture-to-disk-retain`.
+
+.. confval:: capture_to_disk_max_size
+    :type: ``str``
+    :default: ``"0"``
+
+    .. versionadded:: 9.2
+
+    Maximum total size of the retained captured output, e.g. ``50MB`` or
+    ``1.5G`` (plain integers are bytes). Oldest items are evicted when
+    the size is exceeded; ``0`` means unlimited. Can be overridden with
+    :option:`--capture-to-disk-max-size`.
+
+
 .. confval:: junit_logging
     :type: ``"no" | "log" | "system-out" | "system-err" | "out-err" | "all"``
     :default: ``"no"``
@@ -3253,6 +3287,48 @@ Output Capture
 .. option:: -s
 
     Shortcut for :option:`--capture=no`.
+
+.. option:: --capture-to-disk=DIR
+
+    Additionally write each test item's captured output to separate files
+    under ``DIR``: for every phase (``setup``, ``call``, ``teardown``) the
+    captured standard output, standard error and raw
+    file-descriptor-level output are written independently as
+    ``<phase>.stdout``, ``<phase>.stderr``, ``<phase>.stdout.bin`` and
+    ``<phase>.stderr.bin``. The directory tree mirrors the test node id,
+    e.g. ``DIR/test_mod.py/TestClass/test_item[param]/call.stdout``.
+
+    By default only the output of failed items is kept; passing items do
+    not occupy disk after the run. See :option:`--capture-to-disk-retain`
+    and :option:`--capture-to-disk-max-size`. Filesystem errors while
+    writing are ignored and never fail the test; the
+    :confval:`capture_to_disk` ini option enables the same feature from
+    the configuration file.
+
+    .. versionadded:: 9.2
+
+.. option:: --capture-to-disk-retain=policy
+
+    Which items keep their on-disk captured output:
+
+    * ``failed`` (default): only failed items (including setup/teardown
+      errors) are kept.
+    * ``all``: the output of every item is kept.
+
+    Corresponds to the :confval:`capture_to_disk_retain` ini option.
+
+    .. versionadded:: 9.2
+
+.. option:: --capture-to-disk-max-size=SIZE
+
+    Maximum total size of the retained captured output (e.g. ``50MB``,
+    ``1.5G`` or an integer number of bytes). Once the size is exceeded,
+    the oldest retained items are evicted; ``0`` (the default) means
+    unlimited. The item that just finished is never evicted by its own
+    size check. Corresponds to the :confval:`capture_to_disk_max_size`
+    ini option.
+
+    .. versionadded:: 9.2
 
 JUnit XML
 ~~~~~~~~~

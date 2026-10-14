@@ -174,3 +174,62 @@ as a context manager, disabling capture inside the ``with`` block:
    This means that output produced within a test using a capture fixture will
    still be captured and available via ``readouterr()``, even if global capturing
    is disabled.
+
+.. _capture-to-disk:
+
+Persisting captured output per test to disk
+---------------------------------------------------
+
+Normally captured output only lives in memory: failing tests show it in
+the terminal report, while the output of passing tests is discarded. For
+debugging intermittent failures or for archiving output on CI, pytest
+can additionally persist every item's captured output to independent
+files::
+
+    pytest --capture-to-disk=.pytest_captured
+
+For each test item a directory mirroring its node id is created, and for
+every phase (``setup``, ``call``, ``teardown``) that produced output the
+following files are written:
+
+* ``<phase>.stdout`` -- captured standard output as text, identical to
+  the ``Captured stdout <phase>`` report section.
+* ``<phase>.stderr`` -- captured standard error as text.
+* ``<phase>.stdout.bin`` / ``<phase>.stderr.bin`` -- the raw, undecoded
+  file-descriptor-level bytes, including writes by subprocesses or
+  native code (with the default ``fd`` capturing method). Unlike the
+  text files, these preserve output that is not valid UTF-8 byte for
+  byte.
+
+For example, ``test_mod.py::TestClass::test_item[param]`` is located at
+``.pytest_captured/test_mod.py/TestClass/test_item[param]/``.
+
+By default only failed items (including setup/teardown errors) are kept;
+the files of passing items are removed when the item finishes, so they
+do not occupy disk. To keep the output of every item, pass
+``--capture-to-disk-retain=all`` (or set the :confval:`capture_to_disk_retain`
+ini option), and use ``--capture-to-disk-max-size=50MB``
+(:confval:`capture_to_disk_max_size`) to limit the total retained size -
+oldest items are evicted once the limit is exceeded.
+
+The feature can also be enabled from the configuration file via the
+:confval:`capture_to_disk`, :confval:`capture_to_disk_retain` and
+:confval:`capture_to_disk_max_size` ini options; command-line options
+take precedence.
+
+The report of each phase exposes a ``captured_output_files`` mapping
+(logical stream name to absolute path), and the teardown report carries
+``captured_output_dir`` for the directory actually kept (``None`` when
+the item was pruned). Failure reports additionally print a
+``Captured output files`` section pointing at the files; the regular
+``Captured stdout``/``Captured stderr`` sections are unchanged.
+
+Writing to disk is best-effort: disk or permission errors never change
+the outcome of a test and are reported in the terminal summary. When
+running with pytest-xdist (or other multi-process setups), each process
+writes into its own sub-directory (named after the worker, e.g.
+``gw0``); the ``PYTEST_CAPTURE_TO_DISK_WORKER`` environment variable can
+be set to control this name explicitly. The feature has no effect while
+capturing is disabled (``-s``/``--capture=no``), and when it is not
+enabled capturing and reporting behave exactly as before.
+

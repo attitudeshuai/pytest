@@ -9,9 +9,13 @@ from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Iterator
 import contextlib
+import hashlib
 import io
 from io import UnsupportedOperation
 import os
+from pathlib import Path
+import re
+import shutil
 import sys
 from tempfile import TemporaryFile
 from types import TracebackType
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
 
 from _pytest.config import Config
 from _pytest.config import hookimpl
+from _pytest.config import UsageError
 from _pytest.config.argparsing import Parser
 from _pytest.deprecated import check_ispytest
 from _pytest.fixtures import fixture
@@ -41,9 +46,14 @@ from _pytest.nodes import Collector
 from _pytest.nodes import File
 from _pytest.nodes import Item
 from _pytest.reports import CollectReport
+from _pytest.reports import TestReport
+from _pytest.stash import StashKey
 
 
 _CaptureMethod = Literal["fd", "sys", "no", "tee-sys"]
+
+#: Retention policy for on-disk per-item captures.
+_DiskRetainPolicy = Literal["failed", "all"]
 
 
 def pytest_addoption(parser: Parser) -> None:
@@ -62,6 +72,55 @@ def pytest_addoption(parser: Parser) -> None:
         const="no",
         dest="capture",
         help="Shortcut for --capture=no",
+    )
+    group.addoption(
+        "--capture-to-disk",
+        action="store",
+        metavar="DIR",
+        default=None,
+        help="Additionally write each test item's captured output (standard "
+        "output, standard error and file-descriptor-level output) to "
+        "separate files under DIR. By default only the output of failed "
+        "items is kept; see --capture-to-disk-retain and "
+        "--capture-to-disk-max-size.",
+    )
+    group.addoption(
+        "--capture-to-disk-retain",
+        action="store",
+        metavar="policy",
+        choices=["failed", "all"],
+        default=None,
+        help="Which items keep their on-disk captured output: 'failed' "
+        "(default) keeps only failed items, 'all' keeps every item.",
+    )
+    group.addoption(
+        "--capture-to-disk-max-size",
+        action="store",
+        metavar="SIZE",
+        default=None,
+        help="Maximum total size of retained captured output, e.g. '50MB'. "
+        "Oldest items are evicted once the limit is exceeded. 0 (the "
+        "default) means unlimited.",
+    )
+    parser.addini(
+        "capture_to_disk",
+        "Directory in which to persist each test item's captured output to "
+        "separate files (standard output, standard error and "
+        "file-descriptor-level output). Empty (the default) disables the "
+        "feature; --capture-to-disk takes precedence.",
+        default="",
+    )
+    parser.addini(
+        "capture_to_disk_retain",
+        "Which items keep their on-disk captured output: 'failed' (default) "
+        "or 'all'.",
+        default="failed",
+    )
+    parser.addini(
+        "capture_to_disk_max_size",
+        "Maximum total size of retained captured output, e.g. '50MB'; "
+        "oldest items are evicted when exceeded. 0 (default) is unlimited.",
+        default="0",
     )
 
 
@@ -755,6 +814,10 @@ class CaptureManager:
         self._method: Final = method
         self._global_capturing: MultiCapture[str] | None = None
         self._capture_fixture: CaptureFixture[Any] | None = None
+        #: Optional per-item on-disk capture, installed by
+        #: :class:`DiskCaptureManager` only when the feature is enabled.
+        #: When ``None`` (the default) capture behaves exactly as before.
+        self.disk: DiskCaptureManager | None = None
 
     def __repr__(self) -> str:
         return (
@@ -870,9 +933,26 @@ class CaptureManager:
             self.deactivate_fixture()
             self.suspend_global_capture(in_=False)
 
+            # Grab the undecoded, file-descriptor-level bytes before the
+            # normal snap() drains the capture buffers.  Best-effort: the
+            # in-memory/report capture must never be affected by disk issues.
+            disk = self.disk
+            raw: tuple[bytes | None, bytes | None] | None = None
+            if disk is not None and self._global_capturing is not None:
+                try:
+                    raw = disk.peek_raw(self._global_capturing)
+                except OSError:
+                    raw = None
+
             out, err = self.read_global_capture()
             item.add_report_section(when, "stdout", out)
             item.add_report_section(when, "stderr", err)
+
+            if disk is not None:
+                try:
+                    disk.record_phase(item, when, out, err, raw)
+                except OSError:
+                    disk.errors += 1
 
     # Hooks
 
@@ -917,6 +997,474 @@ class CaptureManager:
     @hookimpl(tryfirst=True)
     def pytest_internalerror(self) -> None:
         self.stop_global_capturing()
+
+
+# Per-test capture persistence ("capture to disk").
+#
+# When enabled, every item gets its own directory in which the output of
+# each phase (setup/call/teardown) is written to independent files:
+#
+#     <when>.stdout       text, identical to the "Captured stdout <when>"
+#                         report section
+#     <when>.stderr       text, identical to the "Captured stderr <when>"
+#                         report section
+#     <when>.stdout.bin   raw file-descriptor-level bytes (undecoded)
+#     <when>.stderr.bin   raw file-descriptor-level bytes (undecoded)
+#
+# The directory tree mirrors the node id, e.g.::
+#
+#     <root>/test_dir/test_file.py/TestClass/test_item[param]/call.stdout
+#
+# Files are only created for streams that produced output.  By default the
+# output of passing items is removed when the item finishes, so after the
+# session only failed items occupy disk.  All filesystem errors are
+# swallowed: persistence problems never change the outcome of a test.
+
+disk_key = StashKey["DiskCaptureManager"]()
+
+#: Maximum length of a single path component derived from a node id.
+_DISK_MAX_COMPONENT_LEN = 80
+
+#: Characters that are not safe (or not legal on Windows) in a path
+#: component.  They are percent-encoded, which keeps the mapping injective.
+_DISK_UNSAFE_CHARS_RE = re.compile(r'[<>:"/\\|?*%\x00-\x1f\x7f]')
+
+_DISK_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(?:b)?\s*$", re.IGNORECASE)
+_SIZE_UNITS = {
+    "": 1,
+    "k": 1024,
+    "m": 1024**2,
+    "g": 1024**3,
+    "t": 1024**4,
+}
+
+#: Report section key -> human readable label, in listing order.
+_DISK_FILE_LABELS: tuple[tuple[str, str], ...] = (
+    ("stdout", "standard output"),
+    ("stderr", "standard error"),
+    ("stdout_fd", "file-descriptor-level standard output (raw bytes)"),
+    ("stderr_fd", "file-descriptor-level standard error (raw bytes)"),
+)
+
+
+def _parse_disk_size(value: str) -> int:
+    """Parse a size like ``"50MB"``, ``"1.5g"`` or ``"1024"`` into bytes.
+
+    ``"0"`` means unlimited.
+
+    :raises ValueError: if *value* is not a valid non-negative size.
+    """
+    match = _SIZE_RE.match(value)
+    if not match:
+        raise ValueError(value)
+    number = float(match.group(1)) * _SIZE_UNITS[match.group(2).lower()]
+    return int(number)
+
+
+def _sanitize_disk_component(name: str) -> str:
+    """Make *name* safe to use as a single filesystem path component.
+
+    Percent-encoding guarantees injectivity (two distinct node ids can
+    never collide on the same path); overly long components get a hash
+    suffix instead of being blindly truncated.
+    """
+
+    def _encode(match: re.Match[str]) -> str:
+        return f"%{ord(match.group()):02X}"
+
+    encoded = _DISK_UNSAFE_CHARS_RE.sub(_encode, name)
+    # Windows refuses trailing spaces/dots in path components.
+    if encoded[-1:] in (" ", "."):
+        encoded = encoded[:-1] + f"%{ord(encoded[-1]):02X}"
+    # Windows reserved device names (e.g. "con", "lpt1.py").
+    if encoded.split(".", 1)[0].upper() in _DISK_WINDOWS_RESERVED:
+        encoded += "_"
+    if len(encoded) > _DISK_MAX_COMPONENT_LEN:
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        encoded = encoded[: _DISK_MAX_COMPONENT_LEN - 10] + "__" + digest
+    return encoded
+
+
+def _peek_raw_capture(cap: CaptureBase[Any] | None) -> bytes | None:
+    """Read raw bytes from a capture sink without draining it.
+
+    Runs immediately before :meth:`CaptureBase.snap`; leaves position and
+    contents untouched so the following ``snap()`` behaves exactly as
+    usual.  Returns ``None`` for channels that are not captured.
+    """
+    if cap is None:
+        return None
+    tmpfile = getattr(cap, "tmpfile", None)
+    if tmpfile is None:
+        return None
+    if isinstance(cap, FDCaptureBase):
+        # Same drain as FDCaptureBinary.snap(), minus the truncation (the
+        # regular snap() right after performs it).
+        if os.fstat(tmpfile.fileno()).st_size == 0:
+            return b""
+        tmpfile.seek(0)
+        data = tmpfile.buffer.read()
+        tmpfile.seek(0)
+        return data  # type: ignore[no-any-return]
+    if isinstance(cap, SysCaptureBase):
+        buffer = getattr(tmpfile, "buffer", None)
+        if buffer is None or not hasattr(buffer, "getvalue"):
+            # E.g. DontReadFromInput for stdin (never out/err).
+            return None
+        return bytes(buffer.getvalue())
+    return None
+
+
+class _ItemDiskCapture:
+    """On-disk capture state for a single test item across its phases."""
+
+    def __init__(self, path: Path) -> None:
+        #: Directory holding this item's capture files.
+        self.path = path
+        #: Whether any of the item's phases reported a failure/error.
+        self.failed = False
+        #: ``{phase: {stream key: absolute path string}}``.
+        self.phase_files: dict[str, dict[str, str]] = {}
+
+    def has_files(self) -> bool:
+        return any(self.phase_files.values())
+
+
+class DiskCaptureManager:
+    """Optional plugin persisting per-item captured output to disk.
+
+    Registered only when ``--capture-to-disk`` / the ``capture_to_disk``
+    ini option is set, so a non-opted-in session is byte-for-byte
+    unaffected.  Cooperates with :class:`CaptureManager`, which calls into
+    :meth:`peek_raw`/:meth:`record_phase` from its per-phase capture
+    context.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        root: Path,
+        retain: _DiskRetainPolicy,
+        max_size: int,
+        token: str | None,
+    ) -> None:
+        self.config = config
+        self.root = root
+        self.retain: _DiskRetainPolicy = retain
+        self.max_size = max_size
+        #: Per-process sub-directory name used under xdist/distributed
+        #: execution, so concurrent processes never write the same files.
+        self.token = _sanitize_disk_component(token) if token else None
+        self._items: dict[str, _ItemDiskCapture] = {}
+        #: Directories of retained items, in retention (oldest first)
+        #: order, for the total-size eviction policy.
+        self._retained: list[Path] = []
+        self._total_size = 0
+        #: Number of items pruned because they passed (failed-policy).
+        self.removed_items = 0
+        #: Number of items evicted to satisfy the total-size limit.
+        self.evicted_items = 0
+        #: Number of swallowed filesystem errors.
+        self.errors = 0
+
+    # -- Path layout -----------------------------------------------------
+
+    def item_path(self, item: Item) -> Path:
+        """Return the (token-aware) capture directory for *item*."""
+        node_id = item.id
+        parts = [part for part in node_id.path.split("/") if part not in ("", ".")]
+        names = list(node_id.names)
+        if not names:
+            # Defensive fallback for non-python items without name segments.
+            names = [parts[-1] if parts else str(node_id)]
+        if node_id.params is not None:
+            names[-1] = f"{names[-1]}[{node_id.params}]"
+        parts.extend(names)
+        path = self.root.joinpath(
+            *(_sanitize_disk_component(part) for part in parts)
+        )
+        if self.token is not None:
+            path = path / self.token
+        return path
+
+    def _get_item(self, item: Item) -> _ItemDiskCapture:
+        disk_item = self._items.get(item.nodeid)
+        if disk_item is None:
+            disk_item = _ItemDiskCapture(self.item_path(item))
+            self._items[item.nodeid] = disk_item
+        return disk_item
+
+    # -- CaptureManager integration --------------------------------------
+
+    def peek_raw(
+        self, multicapture: MultiCapture[str]
+    ) -> tuple[bytes | None, bytes | None]:
+        """Return raw ``(stdout, stderr)`` bytes before buffers drain."""
+        return (
+            _peek_raw_capture(multicapture.out),
+            _peek_raw_capture(multicapture.err),
+        )
+
+    def record_phase(
+        self,
+        item: Item,
+        when: str,
+        out: str,
+        err: str,
+        raw: tuple[bytes | None, bytes | None] | None,
+    ) -> None:
+        """Write one phase's captured streams to independent files."""
+        disk_item = self._get_item(item)
+        files = disk_item.phase_files.setdefault(when, {})
+        if out:
+            path = disk_item.path / f"{when}.stdout"
+            if self._write(path, out.encode("utf-8")):
+                files["stdout"] = str(path)
+        if err:
+            path = disk_item.path / f"{when}.stderr"
+            if self._write(path, err.encode("utf-8")):
+                files["stderr"] = str(path)
+        if raw is not None:
+            raw_out, raw_err = raw
+            if raw_out:
+                path = disk_item.path / f"{when}.stdout.bin"
+                if self._write(path, raw_out):
+                    files["stdout_fd"] = str(path)
+            if raw_err:
+                path = disk_item.path / f"{when}.stderr.bin"
+                if self._write(path, raw_err):
+                    files["stderr_fd"] = str(path)
+        if files:
+            item.add_report_section(
+                when, "output files", self._format_files_section(files)
+            )
+
+    def _write(self, path: Path, data: bytes) -> bool:
+        """Write *data* atomically-ish; never raise, report success."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as fp:
+                fp.write(data)
+            return True
+        except OSError:
+            self.errors += 1
+            return False
+
+    @staticmethod
+    def _format_files_section(files: dict[str, str]) -> str:
+        return "\n".join(
+            f"{label}: {files[key]}"
+            for key, label in _DISK_FILE_LABELS
+            if key in files
+        )
+
+    # -- Hooks -----------------------------------------------------------
+
+    @hookimpl(wrapper=True)
+    def pytest_runtest_makereport(
+        self, item: Item, call: Any
+    ) -> Generator[None, TestReport, TestReport]:
+        # Attach the capture-file metadata at makereport time, which is
+        # before logreport hooks and any report serialization (xdist) can
+        # observe the report.
+        report: TestReport = yield
+        disk_item = self._items.get(item.nodeid)
+        if disk_item is not None:
+            if report.failed:
+                disk_item.failed = True
+            report.captured_output_files = dict(
+                disk_item.phase_files.get(report.when, ())
+            )
+            if report.when == "teardown":
+                report.captured_output_dir = self._finalize(item.nodeid)
+        return report
+
+    @hookimpl
+    def pytest_sessionfinish(self, session: Any) -> None:
+        # Safety net for items whose teardown report was never logged
+        # (e.g. interrupted sessions): apply retention so passing-item
+        # output does not linger when the policy says it should not.
+        for nodeid in list(self._items):
+            self._finalize(nodeid)
+
+    @hookimpl
+    def pytest_terminal_summary(
+        self, terminalreporter: Any, exitstatus: int, config: Config
+    ) -> None:
+        lines: list[str] = []
+        if self._retained:
+            lines.append(
+                f"{len(self._retained)} test item(s) with captured output "
+                f"kept in: {self.root}"
+            )
+        if self.evicted_items:
+            lines.append(
+                f"{self.evicted_items} item(s) evicted to stay within the "
+                f"retained-output size limit"
+            )
+        if self.errors:
+            lines.append(
+                f"warning: {self.errors} error(s) while writing captured "
+                f"output to disk were ignored; test outcomes were not "
+                f"affected"
+            )
+        if lines:
+            terminalreporter.write_sep("=", "captured output files")
+            for line in lines:
+                terminalreporter.write_line(line)
+
+    # -- Retention -------------------------------------------------------
+
+    def _finalize(self, nodeid: str) -> str | None:
+        disk_item = self._items.pop(nodeid, None)
+        if disk_item is None:
+            return None
+        try:
+            if self.retain == "all" or disk_item.failed:
+                if disk_item.has_files():
+                    self._retained.append(disk_item.path)
+                    self._total_size += self._directory_size(disk_item.path)
+                    # The item that just finished is protected against this
+                    # round of eviction: its output must survive at least
+                    # until later items can rotate it out.
+                    self._enforce_limit(disk_item.path)
+                    return str(disk_item.path)
+                return None
+            # Default policy: passing items leave nothing on disk.
+            self._remove_tree(disk_item.path)
+            self.removed_items += 1
+        except OSError:
+            self.errors += 1
+        return None
+
+    def _enforce_limit(self, protected: Path | None = None) -> None:
+        if self.max_size <= 0:
+            return
+        while self._total_size > self.max_size:
+            # Evict the oldest non-protected retained item.
+            index = next(
+                (i for i, path in enumerate(self._retained) if path != protected),
+                None,
+            )
+            if index is None:
+                # Only the just-finished item remains: keep it even if it
+                # is larger than the cap on its own.
+                break
+            oldest = self._retained.pop(index)
+            self._total_size -= self._directory_size(oldest)
+            self._remove_tree(oldest)
+            self.evicted_items += 1
+        if self._total_size < 0:
+            self._total_size = 0
+
+    def _remove_tree(self, path: Path) -> None:
+        """Remove *path* and any directories emptied by the removal, up to
+        (but not including) the capture root."""
+        shutil.rmtree(path, ignore_errors=True)
+        parent = path.parent
+        root = self.root
+        while parent != root:
+            try:
+                parent.relative_to(root)
+            except ValueError:
+                break
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        total = 0
+        try:
+            for dirpath, _dirnames, filenames in os.walk(path):
+                for filename in filenames:
+                    try:
+                        total += (Path(dirpath) / filename).stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            return 0
+        return total
+
+
+def pytest_configure(config: Config) -> None:
+    capman: CaptureManager | None = config.pluginmanager.getplugin(
+        "capturemanager"
+    )
+    if capman is None:
+        return
+
+    raw_path = config.option.capture_to_disk or config.getini("capture_to_disk")
+    if not raw_path:
+        return
+
+    root = Path(str(raw_path))
+    if not root.is_absolute():
+        root = config.rootpath / root
+
+    retain = config.option.capture_to_disk_retain
+    if retain is None:
+        retain = config.getini("capture_to_disk_retain")
+    if retain not in ("failed", "all"):
+        raise UsageError(
+            f"invalid capture-to-disk retain policy {retain!r}: "
+            "expected 'failed' or 'all'"
+        )
+
+    raw_max_size = config.option.capture_to_disk_max_size
+    if raw_max_size is None:
+        raw_max_size = config.getini("capture_to_disk_max_size")
+    try:
+        max_size = _parse_disk_size(str(raw_max_size))
+    except ValueError:
+        raise UsageError(
+            f"invalid capture-to-disk max size {raw_max_size!r}: expected a "
+            "size like '50MB', '1.5G' or an integer number of bytes"
+        ) from None
+
+    # Distinct processes (xdist workers, distributed runs) get their own
+    # sub-directory, so file names can never clash.  An explicit override
+    # is available for setups xdist does not identify automatically.
+    token = (
+        os.environ.get("PYTEST_CAPTURE_TO_DISK_WORKER")
+        or os.environ.get("PYTEST_XDIST_WORKER")
+    )
+
+    disk = DiskCaptureManager(
+        config, root, cast(_DiskRetainPolicy, retain), max_size, token
+    )
+    # Fail fast if the user-provided location cannot be created: this is a
+    # configuration error, not a per-test capture write error.
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise UsageError(
+            f"cannot create capture-to-disk directory {root}: {exc}"
+        ) from exc
+    config.stash[disk_key] = disk
+    config.pluginmanager.register(disk, "diskcapturemanager")
+    capman.disk = disk
+
+
+def pytest_unconfigure(config: Config) -> None:
+    disk = config.stash.get(disk_key, None)
+    if disk is None:
+        return
+    capman: CaptureManager | None = config.pluginmanager.getplugin(
+        "capturemanager"
+    )
+    if capman is not None:
+        capman.disk = None
+    config.pluginmanager.unregister(disk)
+    del config.stash[disk_key]
 
 
 class CaptureFixture(Generic[AnyStr]):
