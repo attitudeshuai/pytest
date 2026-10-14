@@ -16,6 +16,7 @@ from collections.abc import Set as AbstractSet
 import dataclasses
 import functools
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
@@ -1671,9 +1672,31 @@ def pytest_addoption(parser: Parser) -> None:
         default=False,
         help="Show fixtures per test",
     )
+    group.addoption(
+        "--fixture-audit",
+        action="store_true",
+        dest="fixture_audit",
+        default=False,
+        help="Show the full fixture override chain (every visible definition, "
+        "the one which wins, and why) per collected test, without running the "
+        "tests. Combined with --fixtures, annotate the fixture list with "
+        "definitions which are overridden and never take effect",
+    )
+    group.addoption(
+        "--fixture-audit-json",
+        dest="fixture_audit_json",
+        metavar="PATH",
+        default=None,
+        help="Write the fixture resolution audit as machine-readable JSON to "
+        "PATH ('-' writes to stdout). Implies --fixture-audit: tests are "
+        "collected but not run. The report contains both all fixture "
+        "definitions (with override status) and the per-test override chains",
+    )
 
 
 def pytest_cmdline_main(config: Config) -> int | ExitCode | None:
+    if config.option.fixture_audit or config.option.fixture_audit_json:
+        return fixture_audit(config)
     if config.option.showfixtures:
         showfixtures(config)
         return 0
@@ -2399,6 +2422,270 @@ class FixtureManager:
         fixturedefs.reverse()
         return fixturedefs
 
+    # ------------------------------------------------------------------
+    # Read-only fixture resolution audit (opt-in; see ``--fixture-audit``).
+    #
+    # The audit methods below never participate in fixture resolution: they
+    # only inspect the registration structures (``_arg2node2fixturedefs`` and
+    # ``_arg2nodeid2fixturedefs``) and the per-item ``FuncFixtureInfo`` which
+    # were computed by the regular collection flow. Nothing here registers,
+    # reorders or otherwise mutates fixture definitions.
+    # ------------------------------------------------------------------
+
+    def _audit_registration_rank(
+        self, argname: str, fixturedef: FixtureDef[Any]
+    ) -> int:
+        """Order of ``fixturedef`` among same-name defs with equal visibility.
+
+        Definitions are stored latest-first (``_register_fixture`` uses
+        ``insert(0)``) and the final resolution reverses them, so a higher
+        rank means "registered later => wins at equal visibility".
+        """
+        node2fixturedefs = self._arg2node2fixturedefs.get(argname, {})
+        nodeid2fixturedefs = self._arg2nodeid2fixturedefs.get(argname, {})
+        if fixturedef.node is not None:
+            combined = [
+                *node2fixturedefs.get(fixturedef.node, ()),
+                *nodeid2fixturedefs.get(fixturedef.node.nodeid, ()),
+            ]
+        else:
+            # Legacy nodeid-based registration without a node reference.
+            combined = [*nodeid2fixturedefs.get(fixturedef.baseid, ())]
+        try:
+            position = combined.index(fixturedef)
+        except ValueError:
+            return 0
+        return len(combined) - 1 - position
+
+    def audit_definitions(self) -> list[dict[str, Any]]:
+        """Audit all registered fixture definitions (read-only).
+
+        Each entry describes one :class:`FixtureDef`: where it is defined,
+        where it is visible, whether it is shadowed by same-named fixtures
+        (``"active"``, ``"overridden"`` or ``"partially_overridden"``) and
+        by which definitions, including the precedence reason.
+
+        This does not change fixture resolution and reports name clashes
+        without turning them into errors.
+
+        .. versionadded:: 9.2
+        """
+        invocation_dir = self.config.invocation_params.dir
+        by_name: dict[str, list[FixtureDef[Any]]] = defaultdict(list)
+        for fixturedef in self._get_all_fixture_defs():
+            by_name[fixturedef.argname].append(fixturedef)
+
+        definitions: list[dict[str, Any]] = []
+        for argname, fixturedefs in by_name.items():
+            ranks = {
+                id(fixturedef): self._audit_registration_rank(argname, fixturedef)
+                for fixturedef in fixturedefs
+            }
+            for fixturedef in fixturedefs:
+                overridden_by: list[dict[str, Any]] = []
+                same_node_overridden = False
+                for other in fixturedefs:
+                    if other is fixturedef:
+                        continue
+                    if _audit_same_visibility(fixturedef, other):
+                        # At the same visibility node, only later registrations
+                        # override this one.
+                        if ranks[id(other)] <= ranks[id(fixturedef)]:
+                            continue
+                        relation, reason = _audit_layer_relation(fixturedef, other)
+                        same_node_overridden = True
+                    elif is_visibility_more_specific(other, fixturedef):
+                        relation, reason = _audit_layer_relation(fixturedef, other)
+                    else:
+                        # Incomparable visibility (e.g. disjoint subtrees).
+                        continue
+                    overridden_by.append(
+                        {
+                            "location": _audit_fixture_location(
+                                other.func, invocation_dir
+                            ),
+                            "defined_at": _audit_defined_at(other),
+                            "relation": relation,
+                            "reason": reason,
+                        }
+                    )
+                if overridden_by and same_node_overridden:
+                    status = "overridden"
+                elif overridden_by:
+                    status = "partially_overridden"
+                else:
+                    status = "active"
+                definitions.append(
+                    {
+                        "argname": argname,
+                        "scope": fixturedef.scope,
+                        "location": _audit_fixture_location(
+                            fixturedef.func, invocation_dir
+                        ),
+                        "defined_at": _audit_defined_at(fixturedef),
+                        "status": status,
+                        "overridden_by": overridden_by,
+                    }
+                )
+        definitions.sort(
+            key=lambda d: (
+                d["argname"],
+                d["defined_at"]["nodeid"],
+                d["location"]["path"],
+                d["location"]["line"] or 0,
+            )
+        )
+        return definitions
+
+    def audit_item(self, item: nodes.Item) -> dict[str, Any] | None:
+        """Audit the fixture resolution of one collected item (read-only).
+
+        Returns the complete override chain for every statically known
+        fixture of the item: each visible :class:`FixtureDef` layer with its
+        location, the winning layer and the reason why it wins, plus which
+        outer layers are still instantiated because an inner fixture requests
+        its own overridden name ("super fixture" access).
+
+        Returns ``None`` for items without fixture information. Dynamic
+        ``request.getfixturevalue()`` calls are not visible statically and
+        are not included (same limitation as ``--fixtures-per-test``).
+
+        .. versionadded:: 9.2
+        """
+        from _pytest.python import DirectParamFixtureDef
+
+        fixture_info: FuncFixtureInfo | None = getattr(item, "_fixtureinfo", None)
+        if fixture_info is None:
+            return None
+
+        invocation_dir = self.config.invocation_params.dir
+        direct_parametrize_args = _get_direct_parametrize_args(item)
+        usefixtures_names = set(self._getusefixturesnames(item))
+        autouse_names = set(self._getautousenames(item))
+        # Statically mirror FixtureRequest._get_active_fixturedef to find out
+        # which chain layers are actually instantiated at runtime.
+        active_layers = _audit_traverse_active_layers(
+            initialnames=fixture_info.initialnames,
+            name2fixturedefs=fixture_info.name2fixturedefs,
+            ignore_args=direct_parametrize_args,
+        )
+
+        def requested_by(argname: str) -> str:
+            if argname in fixture_info.argnames:
+                return "parameter"
+            if argname in usefixtures_names:
+                return "usefixtures"
+            if argname in autouse_names:
+                return "autouse"
+            return "dependency"
+
+        fixtures: list[dict[str, Any]] = []
+        for argname in fixture_info.names_closure:
+            if argname in direct_parametrize_args or argname == "request":
+                # Direct parametrization arguments are test parameters, not
+                # fixtures; "request" is a built-in special case without a
+                # registered FixtureDef.
+                continue
+            chain = fixture_info.name2fixturedefs.get(argname)
+            if not chain:
+                fixtures.append(
+                    {
+                        "argname": argname,
+                        "requested_by": requested_by(argname),
+                        "found": False,
+                        "winner_index": None,
+                        "winner_reason": None,
+                        "chain": [],
+                    }
+                )
+                continue
+            if isinstance(chain[-1], DirectParamFixtureDef):
+                # Artificial fixture def desugared from direct parametrization.
+                continue
+
+            winner_index = len(chain) - 1
+            selected = active_layers.get(argname, set())
+            layers: list[dict[str, Any]] = []
+            precedence_reasons: list[str] = []
+            for index, fixturedef in enumerate(chain):
+                negative_index = index - len(chain)
+                if index == winner_index:
+                    role = "winner"
+                    active = True
+                    reason = (
+                        "winning definition for this item: pytest resolves the "
+                        "fixture name from the outermost visible definition "
+                        "towards the item and uses the closest one"
+                    )
+                else:
+                    relation, why = _audit_layer_relation(fixturedef, chain[index + 1])
+                    if relation not in precedence_reasons:
+                        precedence_reasons.append(relation)
+                    if negative_index in selected:
+                        role = "super"
+                        active = True
+                        reason = (
+                            f"shadowed for direct requests by the definition at "
+                            f"chain index {index + 1}, but still instantiated as "
+                            f"the overridden ('super') fixture, because a more "
+                            f"specific definition requests {argname!r}. {why}"
+                        )
+                    else:
+                        role = "shadowed"
+                        active = False
+                        reason = (
+                            f"not used through static fixture resolution for this "
+                            f"item: shadowed by the definition at chain index "
+                            f"{index + 1}. It could still be requested dynamically "
+                            f"with request.getfixturevalue({argname!r}), which is "
+                            f"not visible during collection. {why}"
+                        )
+                layers.append(
+                    {
+                        "index": index,
+                        "role": role,
+                        "active": active,
+                        "scope": fixturedef.scope,
+                        "location": _audit_fixture_location(
+                            fixturedef.func, invocation_dir
+                        ),
+                        "defined_at": _audit_defined_at(fixturedef),
+                        "shadowed_by_index": None if role == "winner" else index + 1,
+                        "reason": reason,
+                    }
+                )
+
+            reason_bits = []
+            if "same_node_later_registration" in precedence_reasons:
+                reason_bits.append("later registration at an equally visible node")
+            if "more_specific_node" in precedence_reasons:
+                reason_bits.append("a definition registered at a closer node")
+            winner_reason = (
+                f"The closest of {len(chain)} definition(s) with this name "
+                f"visible to the item is used (chain index {winner_index}); "
+                f"precedence is determined by {' and '.join(reason_bits) or 'visibility'}."
+            )
+            outer_active = sorted(i for i in selected if i != -1)
+            if outer_active:
+                winner_reason += (
+                    f" {len(outer_active)} outer definition(s) are additionally "
+                    f"instantiated because the active fixture requests the "
+                    f"overridden name {argname!r}."
+                )
+
+            fixtures.append(
+                {
+                    "argname": argname,
+                    "requested_by": requested_by(argname),
+                    "found": True,
+                    "winner_index": winner_index,
+                    "winner_reason": winner_reason,
+                    "chain": layers,
+                }
+            )
+
+        return {"nodeid": item.nodeid, "fixtures": fixtures}
+
 
 def show_fixtures_per_test(config: Config) -> int | ExitCode:
     from _pytest.main import wrap_session
@@ -2552,6 +2839,406 @@ def _showfixtures_main(config: Config, session: Session) -> None:
 def write_docstring(tw: TerminalWriter, doc: str, indent: str = "    ") -> None:
     for line in doc.split("\n"):
         tw.line(indent + line)
+
+
+# ----------------------------------------------------------------------
+# Fixture resolution audit (--fixture-audit / --fixture-audit-json).
+#
+# Everything in this section is read-only analysis of data produced by
+# normal collection: it never changes which FixtureDef wins, never warns
+# or errors on name clashes, and is only executed when auditing is
+# explicitly enabled.
+# ----------------------------------------------------------------------
+
+FIXTURE_AUDIT_SCHEMA_VERSION = "1.0"
+
+
+class _NullTextOutput:
+    """In-memory no-op text stream, used to keep stdout pure JSON."""
+
+    encoding = "utf-8"
+    errors = "strict"
+    newlines = "\n"
+    mode = "w"
+
+    def write(self, text: str = "") -> int:
+        return len(text)
+
+    def writelines(self, lines: Iterable[str]) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        raise OSError("no file descriptor")
+
+
+def _audit_fixture_location(func: object, invocation_dir: Path) -> dict[str, Any]:
+    """Source location information of a fixture factory function.
+
+    The path/line use the same ``getlocation()`` value as the existing
+    ``--fixtures`` listing, so the audit never disagrees with it.
+    """
+    fspath, _ = getfslineno(func)
+    path: Path | None = None
+    if fspath:
+        try:
+            path = absolutepath(os.fspath(fspath))
+        except ValueError:
+            path = None
+    # getlocation() renders "<path>:<line>" relative to invocation_dir.
+    location = getlocation(func, invocation_dir)
+    relpath, sep, line_text = location.rpartition(":")
+    line = int(line_text) if sep and line_text.isdigit() else None
+    return {
+        "path": str(path) if path is not None else "",
+        "relpath": relpath or (str(path) if path is not None else ""),
+        "line": line,
+        "function": getattr(func, "__name__", ""),
+        "module": getattr(func, "__module__", ""),
+        "docstring": inspect.getdoc(func),
+    }
+
+
+def _audit_defined_at(fixturedef: FixtureDef[Any]) -> dict[str, str]:
+    """Human- and machine-readable description of a definition's visibility."""
+    node = fixturedef.node
+    if node is None:
+        # Legacy nodeid-based registration (deprecated API).
+        return {
+            "nodeid": fixturedef.baseid,
+            "kind": "legacy_nodeid",
+            "description": f"registered with legacy baseid {fixturedef.baseid!r}",
+        }
+    nodeid = node.nodeid
+    kind = type(node).__name__
+    if isinstance(node, Session):
+        description = "session-global node (a plugin fixture, visible to all items)"
+    elif kind in ("Directory", "Dir"):
+        if nodeid:
+            description = f"conftest.py visible in directory {nodeid!r}"
+        else:
+            description = "conftest.py visible in the root directory"
+    elif kind == "Package":
+        description = f"package {nodeid!r}"
+    elif kind == "Module":
+        description = f"test module {nodeid!r}"
+    elif kind == "Class":
+        description = f"class {nodeid!r}"
+    else:
+        description = f"{kind.lower()} node {nodeid!r}"
+    return {
+        "nodeid": nodeid,
+        "kind": kind.lower(),
+        "description": description,
+    }
+
+
+def _audit_same_visibility(fixturedef: FixtureDef[Any], other: FixtureDef[Any]) -> bool:
+    """Whether the two definitions are registered at the same visibility node."""
+    if fixturedef.node is not None and other.node is not None:
+        return fixturedef.node is other.node
+    return (
+        fixturedef.node is None
+        and other.node is None
+        and fixturedef.baseid == other.baseid
+    )
+
+
+def _audit_layer_relation(
+    outer: FixtureDef[Any], inner: FixtureDef[Any]
+) -> tuple[str, str]:
+    """Explain why ``inner`` takes precedence over ``outer`` in a chain.
+
+    ``inner`` is the next definition closer to the item. Returns a stable
+    machine-readable relation code and a human-readable reason.
+    """
+    inner_at = _audit_defined_at(inner)["description"]
+    outer_at = _audit_defined_at(outer)["description"]
+    if _audit_same_visibility(outer, inner):
+        return (
+            "same_node_later_registration",
+            f"registered later at the same node ({inner_at}); among fixtures "
+            "with equal visibility, later registrations override earlier ones "
+            "(e.g. clashing fixtures from two plugins)",
+        )
+    return (
+        "more_specific_node",
+        f"registered at a node closer to the item ({inner_at}); pytest "
+        f"resolves fixture names from the outermost scope towards the item, "
+        f"so this overrides the outer definition at {outer_at}",
+    )
+
+
+def _audit_traverse_active_layers(
+    initialnames: Iterable[str],
+    name2fixturedefs: Mapping[str, Sequence[FixtureDef[Any]]],
+    ignore_args: AbstractSet[str] = frozenset(),
+) -> dict[str, set[int]]:
+    """Statically mirror ``FixtureRequest._get_active_fixturedef``.
+
+    Returns a mapping from a fixture name to the negative chain indices of
+    the layers which get instantiated at runtime: ``-1`` is the winning
+    definition; ``-2`` and below are outer definitions reached because an
+    inner fixture requests its own overridden name (possibly transitively).
+
+    The index bookkeeping is intentionally the same as in
+    ``traverse_fixture_closure`` so the audit cannot disagree with the real
+    resolution about which layer is hit.
+    """
+    current_indices: dict[str, int] = {}
+    selected: dict[str, set[int]] = defaultdict(set)
+
+    def process_argname(argname: str) -> None:
+        index = current_indices.get(argname)
+        if index == -1:
+            return
+        if index is None:
+            current_indices[argname] = -1
+
+        if argname in ignore_args:
+            fixturedefs = None
+        else:
+            fixturedefs = name2fixturedefs.get(argname)
+        if not fixturedefs:
+            return
+
+        index = current_indices.get(argname, -1)
+        if -index > len(fixturedefs):
+            return
+        fixturedef = fixturedefs[index]
+        selected[argname].add(index)
+        current_indices[argname] = index - 1
+        for dep in fixturedef.argnames:
+            process_argname(dep)
+        current_indices[argname] = index
+
+    for argname in initialnames:
+        process_argname(argname)
+    return selected
+
+
+def build_fixture_audit_report(session: Session) -> dict[str, Any]:
+    """Build the full machine-readable fixture audit report for a session.
+
+    The report contains all registered definitions with their override
+    status and, for every collected item, the complete override chains.
+    Building the report is read-only.
+    """
+    fm = session._fixturemanager
+    items: list[dict[str, Any]] = []
+    for item in session.items:
+        item_report = fm.audit_item(item)
+        if item_report is not None:
+            items.append(item_report)
+    return {
+        "schema_version": FIXTURE_AUDIT_SCHEMA_VERSION,
+        "pytest_version": _pytest.__version__,
+        "rootpath": str(session.config.rootpath),
+        "definitions": fm.audit_definitions(),
+        "items": items,
+    }
+
+
+def fixture_audit(config: Config) -> int | ExitCode:
+    from _pytest.main import wrap_session
+
+    return wrap_session(config, _fixture_audit_main)
+
+
+def _fixture_audit_main(config: Config, session: Session) -> None:
+    session.perform_collect()
+    report = build_fixture_audit_report(session)
+
+    json_target = config.option.fixture_audit_json
+    if json_target is not None:
+        payload = json.dumps(report, indent=2) + "\n"
+        if json_target == "-":
+            # Machine-readable output on stdout: suppress the human report
+            # and any further terminal output so external tools can parse
+            # the stream as pure JSON. Use an in-memory sink rather than a
+            # real file descriptor so teardown cannot emit resource warnings.
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+            null_output = _NullTextOutput()
+            sys.stdout = null_output  # type: ignore[assignment]
+            terminalreporter = config.pluginmanager.get_plugin("terminalreporter")
+            if terminalreporter is not None:
+                terminalreporter._tw._file = null_output
+            return
+        output_path = Path(json_target)
+        if not output_path.is_absolute():
+            output_path = config.invocation_params.dir / output_path
+        output_path.write_text(payload, encoding="utf-8")
+
+    if config.option.showfixtures:
+        _showfixtures_audit_main(config, session, report)
+    else:
+        _show_fixture_audit_per_test_main(config, session, report)
+
+
+def _show_fixture_audit_per_test_main(
+    config: Config, session: Session, report: dict[str, Any]
+) -> None:
+    import _pytest.config
+
+    tw = _pytest.config.create_terminal_writer(config)
+    verbose = config.get_verbosity()
+
+    for item_report in report["items"]:
+        fixtures = [
+            fixture
+            for fixture in item_report["fixtures"]
+            if verbose > 0 or not fixture["argname"].startswith("_")
+        ]
+        if not fixtures:
+            continue
+
+        tw.line()
+        tw.sep("-", f"fixture audit for {item_report['nodeid']}")
+        for fixture in fixtures:
+            tw.write("* ", green=True)
+            tw.write(fixture["argname"], green=True)
+            tw.write(f"  (requested by: {fixture['requested_by']})", cyan=True)
+            tw.write("\n")
+            if not fixture["found"]:
+                tw.line(
+                    "    no definition visible to this item "
+                    "(would raise FixtureLookupError at setup)",
+                    red=True,
+                )
+                continue
+            for layer in fixture["chain"]:
+                role = layer["role"]
+                tag = {
+                    "winner": "[winner]  ",
+                    "super": "[super]   ",
+                    "shadowed": "[shadowed]",
+                }[role]
+                location = layer["location"]
+                defined_at = layer["defined_at"]
+                color = {
+                    "winner": "green",
+                    "super": "cyan",
+                    "shadowed": "red",
+                }[role]
+                tw.write(f"    {tag} ", **{color: True})
+                tw.write(
+                    f"{location['relpath']}:{location['line']}: {location['function']}",
+                    yellow=True,
+                )
+                tw.write(f"  -- {defined_at['description']} [{layer['scope']} scope]")
+                tw.write("\n")
+            tw.line(f"    reason: {fixture['winner_reason']}")
+
+
+def _showfixtures_audit_main(
+    config: Config, session: Session, report: dict[str, Any]
+) -> None:
+    """``--fixtures --fixture-audit``: the normal fixture list annotated
+    with definitions which are overridden and do not take effect."""
+    import _pytest.config
+
+    invocation_dir = config.invocation_params.dir
+    tw = _pytest.config.create_terminal_writer(config)
+    verbose = config.get_verbosity()
+    fm = session._fixturemanager
+
+    # Index the audit entries so the existing listing can be annotated.
+    status_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for entry in report["definitions"]:
+        location = entry["location"]
+        key = (
+            entry["argname"],
+            location["path"] or location["module"],
+            location["line"],
+            location["function"],
+        )
+        status_by_key[key] = entry
+
+    available = []
+    for fixturedef in fm._get_all_fixture_defs():
+        available.append(
+            (
+                len(fixturedef.baseid),
+                fixturedef.func.__module__,
+                _pretty_fixture_path(invocation_dir, fixturedef.func),
+                fixturedef.argname,
+                fixturedef,
+            )
+        )
+    available.sort()
+
+    currentmodule = None
+    for baseid, module, prettypath, argname, fixturedef in available:
+        if currentmodule != module:
+            if not module.startswith("_pytest."):
+                tw.line()
+                tw.sep("-", f"fixtures defined from {module}")
+                currentmodule = module
+        if verbose <= 0 and argname.startswith("_"):
+            continue
+        location = _audit_fixture_location(fixturedef.func, invocation_dir)
+        audit_entry = status_by_key.get(
+            (
+                argname,
+                location["path"] or location["module"],
+                location["line"],
+                location["function"],
+            )
+        )
+        status = audit_entry["status"] if audit_entry else "active"
+        tw.write(f"{argname}", green=True)
+        if fixturedef.scope != "function":
+            tw.write(f" [{fixturedef.scope} scope]", cyan=True)
+        if status == "overridden":
+            tw.write(" [overridden: never takes effect]", red=True)
+        elif status == "partially_overridden":
+            tw.write(" [overridden for some items]", yellow=True)
+        tw.write(f" -- {prettypath}", yellow=True)
+        tw.write("\n")
+        doc = inspect.getdoc(fixturedef.func)
+        if doc:
+            write_docstring(
+                tw, doc.split("\n\n", maxsplit=1)[0] if verbose <= 0 else doc
+            )
+        else:
+            tw.line("    no docstring available", red=True)
+        if audit_entry and audit_entry["overridden_by"]:
+            if status == "overridden":
+                tw.line(
+                    "    OVERRIDDEN: another definition with the same name always "
+                    "takes precedence:",
+                    red=True,
+                )
+            else:
+                tw.line(
+                    "    OVERRIDDEN IN PART: takes effect only for items outside "
+                    "the subtree of:",
+                    yellow=True,
+                )
+            shown = audit_entry["overridden_by"]
+            if verbose <= 0:
+                shown = shown[:1]
+            for override in shown:
+                override_location = override["location"]
+                tw.line(
+                    f"      {override_location['relpath']}:"
+                    f"{override_location['line']} -- "
+                    f"{override['defined_at']['description']}",
+                    red=status == "overridden",
+                    yellow=status == "partially_overridden",
+                )
+            if verbose <= 0 and len(audit_entry["overridden_by"]) > 1:
+                tw.line(
+                    "      (use -v to show all overriding definitions)",
+                    yellow=True,
+                )
+        tw.line()
 
 
 def register_fixture(

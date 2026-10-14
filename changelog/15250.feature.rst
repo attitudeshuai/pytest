@@ -1,0 +1,9 @@
+Added a read-only fixture resolution audit: ``--fixture-audit`` prints, for
+each collected test, the complete override chain of every fixture parameter
+(all visible definitions, the one that wins and why), including outer
+definitions that are still instantiated through "super fixture" self-requests,
+while ``--fixtures --fixture-audit`` marks definitions which are overridden
+and never take effect. ``--fixture-audit-json=PATH`` writes the same data
+(``-`` for stdout) as machine-readable JSON. Auditing never changes fixture
+resolution, reports same-name clashes without turning them into errors and
+has no effect when not enabled.
