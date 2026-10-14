@@ -120,3 +120,6 @@ def pytest_configure(config: Config) -> None:
         "filterwarnings(warning): add a warning filter to the given test. "
         "see https://docs.pytest.org/en/stable/how-to/capture-warnings.html#pytest-mark-filterwarnings ",
     )
+    from _pytest.warnings_baseline import configure_warnings_baseline
+
+    configure_warnings_baseline(config)

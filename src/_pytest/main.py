@@ -149,6 +149,64 @@ def pytest_addoption(parser: Parser) -> None:
         default=None,
     )
 
+    group.addoption(
+        "--warnings-baseline",
+        dest="warnings_baseline",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="Path to a warnings baseline file. Captured warnings are "
+        "compared against it: new warnings are reported or fail the run "
+        "(see --warnings-baseline-on-new), while baseline warnings that no "
+        "longer occur are listed for write-off. Can also be set with the "
+        "`warnings_baseline` configuration option.",
+    )
+    group.addoption(
+        "--warnings-baseline-update",
+        dest="warnings_baseline_update",
+        action="store_true",
+        default=False,
+        help="Atomically rewrite the warnings baseline file from the warnings "
+        "captured in this run: new warnings are registered and warnings that "
+        "no longer occur are written off.",
+    )
+    group.addoption(
+        "--warnings-baseline-merge",
+        dest="warnings_baseline_merge",
+        action="store_true",
+        default=False,
+        help="Atomically merge the warnings captured in this run into the "
+        "existing warnings baseline. Unlike --warnings-baseline-update, "
+        "baseline entries not observed in this run are kept, which allows "
+        "registering a baseline across several partial or sharded runs.",
+    )
+    group.addoption(
+        "--warnings-baseline-on-new",
+        dest="warnings_baseline_on_new",
+        action="store",
+        default=None,
+        choices=("warn", "fail"),
+        metavar="ACTION",
+        help="What to do with warnings not present in the configured "
+        "warnings baseline: 'warn' (the default) only annotates them in the "
+        "terminal summary, 'fail' exits with code 7 when all tests pass. "
+        "Can also be set with the `warnings_baseline_on_new` configuration "
+        "option.",
+    )
+    parser.addini(
+        "warnings_baseline",
+        type="paths",
+        help="Path to a warnings baseline file; see --warnings-baseline. "
+        "Relative paths are resolved relative to the configuration file.",
+    )
+    parser.addini(
+        "warnings_baseline_on_new",
+        type=Literal["warn", "fail"],
+        default="warn",
+        help="Whether new warnings not present in the warnings baseline are "
+        "only reported ('warn', the default) or fail the run ('fail').",
+    )
+
     group = parser.getgroup("collect", "collection")
     group.addoption(
         "--collectonly",

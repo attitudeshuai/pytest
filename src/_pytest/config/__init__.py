@@ -125,6 +125,9 @@ class ExitCode(enum.IntEnum):
     NO_TESTS_COLLECTED = 5
     #: All tests pass, but maximum number of warnings exceeded.
     MAX_WARNINGS_ERROR = 6
+    #: All tests pass, but warnings not present in the configured warnings
+    #: baseline were captured.
+    WARNINGS_BASELINE_ERROR = 7
 
     __module__ = "pytest"
 

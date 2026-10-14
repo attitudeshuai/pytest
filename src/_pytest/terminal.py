@@ -996,6 +996,7 @@ class TerminalReporter:
             ExitCode.USAGE_ERROR,
             ExitCode.NO_TESTS_COLLECTED,
             ExitCode.MAX_WARNINGS_ERROR,
+            ExitCode.WARNINGS_BASELINE_ERROR,
         )
         # Always invoke pytest_terminal_summary so third-party plugins can report
         # (e.g. coverage). --no-summary only suppresses TerminalReporter's own

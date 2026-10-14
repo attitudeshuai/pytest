@@ -1737,6 +1737,57 @@ passed multiple times. The expected format is ``name=value``. For example::
    Can also be set via the :option:`--max-warnings` command-line option.
 
 
+.. confval:: warnings_baseline
+   :type: ``path``
+
+   .. versionadded:: 9.2
+
+   Path to a warnings baseline file. Each warning captured during a run is
+   identified by the emitting test node id, warning category, code location and
+   message text. When a baseline is configured, the warnings of a run are
+   compared against it: new warnings are reported in the terminal summary or
+   fail the run according to :confval:`warnings_baseline_on_new`, and baseline
+   entries that are no longer observed are listed as write-off candidates.
+
+   The baseline is registered or refreshed via the
+   :option:`--warnings-baseline-update` and :option:`--warnings-baseline-merge`
+   command-line options. Relative paths are resolved relative to the
+   configuration file. See :ref:`warnings-baselines` for more information.
+
+   .. tab:: toml
+
+       .. code-block:: toml
+
+            [pytest]
+            warnings_baseline = ["warnings-baseline.json"]
+
+   .. tab:: ini
+
+       .. code-block:: ini
+
+            [pytest]
+            warnings_baseline = warnings-baseline.json
+
+   Can also be set via the :option:`--warnings-baseline` command-line option.
+
+.. confval:: warnings_baseline_on_new
+   :type: ``"warn" | "fail"``
+   :default: ``"warn"``
+
+   .. versionadded:: 9.2
+
+   What to do with warnings captured during a run that are not present in the
+   configured :confval:`warnings_baseline`:
+
+   * ``warn`` (the default): only annotate the new warnings in the terminal
+     summary;
+   * ``fail``: exit with :class:`pytest.ExitCode` ``WARNINGS_BASELINE_ERROR``
+     (code ``7``) when all tests pass but new warnings were captured.
+
+   Can also be set via the :option:`--warnings-baseline-on-new` command-line
+   option.
+
+
 .. confval:: junit_duration_report
     :type: ``"total" | "call"``
     :default: ``"total"``
@@ -3295,6 +3346,43 @@ Warnings
     Exit with :class:`pytest.ExitCode` ``MAX_WARNINGS_ERROR`` (code ``6``) if all the tests pass, but the number
     of warnings exceeds the given threshold. By default there is no limit.
     Can also be set via the :confval:`max_warnings` configuration option.
+
+.. option:: --warnings-baseline=PATH
+
+    .. versionadded:: 9.2
+
+    Path to a warnings baseline file to compare captured warnings against.
+    Can also be set via the :confval:`warnings_baseline` configuration option.
+    See :ref:`warnings-baselines` for more information.
+
+.. option:: --warnings-baseline-update
+
+    .. versionadded:: 9.2
+
+    Atomically rewrite the warnings baseline file from the warnings captured
+    in this run: new warnings are registered and baseline warnings that no
+    longer occur are written off. Requires :option:`--warnings-baseline` or
+    :confval:`warnings_baseline`.
+
+.. option:: --warnings-baseline-merge
+
+    .. versionadded:: 9.2
+
+    Atomically merge the warnings captured in this run into the existing
+    warnings baseline. Unlike :option:`--warnings-baseline-update`, baseline
+    entries not observed in this run are kept, which allows registering a
+    baseline across several partial or sharded runs.
+
+.. option:: --warnings-baseline-on-new=ACTION
+
+    .. versionadded:: 9.2
+
+    Whether warnings not present in the configured warnings baseline are only
+    reported (``warn``, the default) or fail the run with
+    :class:`pytest.ExitCode` ``WARNINGS_BASELINE_ERROR`` (code ``7``) when all
+    tests pass (``fail``).
+    Can also be set via the :confval:`warnings_baseline_on_new` configuration
+    option.
 
 Doctest
 ~~~~~~~

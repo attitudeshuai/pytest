@@ -244,6 +244,91 @@ The threshold can also be set in the configuration file using :confval:`max_warn
     regardless of the warning count. ``MAX_WARNINGS_ERROR`` is only reported when all tests pass
     but the warning threshold is exceeded.
 
+.. _warnings-baselines:
+
+Warnings baselines
+------------------
+
+.. versionadded:: 9.2
+
+Static warning filters can only suppress a whole category of warnings or turn
+them into errors at the first occurrence. When a test suite already emits a
+number of warnings and the goal is to stop *new* warnings from being added
+while the existing ones are fixed gradually, a warnings baseline provides a
+persistent registry instead.
+
+A baseline is a JSON file in which every captured warning is registered by
+the emitting test node id, warning category, code location (file and line) and
+message text. The file additionally carries a schema version and information
+about the environment that generated it (pytest, Python and platform
+versions), so baselines produced in different environments can be told apart.
+
+Register the warnings of the current run as the baseline with
+:option:`--warnings-baseline-update`:
+
+.. code-block:: bash
+
+    pytest --warnings-baseline=warnings-baseline.json --warnings-baseline-update
+
+The baseline is written atomically: the file is either fully replaced or left
+completely unchanged. On subsequent runs, captured warnings are compared with
+the baseline:
+
+* warnings that are not in the baseline are reported as **new**;
+* baseline entries that are no longer observed are listed as write-off
+  candidates.
+
+.. code-block:: bash
+
+    pytest --warnings-baseline=warnings-baseline.json
+
+By default new warnings are only annotated in a ``warnings baseline`` section
+of the terminal summary, without affecting the exit code. Set
+:confval:`warnings_baseline_on_new` to ``fail`` (or pass
+:option:`--warnings-baseline-on-new=fail <--warnings-baseline-on-new>`) to
+exit with code ``7`` (:class:`~pytest.ExitCode` ``WARNINGS_BASELINE_ERROR``)
+when all tests pass but new warnings were captured:
+
+.. tab:: toml
+
+    .. code-block:: toml
+
+        [pytest]
+        warnings_baseline = ["warnings-baseline.json"]
+        warnings_baseline_on_new = "fail"
+
+.. tab:: ini
+
+    .. code-block:: ini
+
+        [pytest]
+        warnings_baseline = warnings-baseline.json
+        warnings_baseline_on_new = fail
+
+Once the warnings behind a baseline entry have actually been fixed, the entry
+is reported as not observed anymore; running
+:option:`--warnings-baseline-update` again rewrites the baseline and writes
+those entries off.
+
+Baselines can also be assembled across several partial or sharded runs:
+:option:`--warnings-baseline-merge` registers the warnings captured in a run
+**in addition to** the existing entries instead of replacing the file, so
+entries for tests that were not part of the run are kept:
+
+.. code-block:: bash
+
+    pytest -k part_one --warnings-baseline=warnings-baseline.json --warnings-baseline-merge
+    pytest -k part_two --warnings-baseline=warnings-baseline.json --warnings-baseline-merge
+
+The baseline is never written when the session does not complete successfully
+(for example when tests fail, are interrupted or no tests were collected), so
+an incomplete run cannot write off warnings that simply were not reached.
+
+The baseline does not change which warnings are captured: :confval:`filterwarnings`
+filters, the :option:`-W` option and the warnings summary keep working exactly
+as without a baseline -- filtered warnings never appear in the baseline.
+When no baseline is configured, this feature is entirely inactive.
+
 Disabling warnings summary
 --------------------------
 
